@@ -169,6 +169,7 @@ class LeapHandEnvCfg(DirectRLEnvCfg):
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=8192, env_spacing=0.75, replicate_physics=False)
     # reward scales
     z_rotation_steps = 16
+    fixed_goal_angle_deg = None  # If set, goal orientation will be fixed at this angle (in degrees) instead of advancing
     dist_reward_scale = -10.0
     rot_reward_scale = 1.0
     rot_eps = 0.1

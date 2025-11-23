@@ -26,6 +26,7 @@ parser.add_argument(
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
 parser.add_argument("--sigma", type=str, default=None, help="The policy's initial standard deviation.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument("--goal_angle", type=float, default=None, help="Fixed goal angle in degrees (if not specified, uses advancing goal).")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -80,6 +81,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if args_cli.goal_angle is not None:
+        env_cfg.fixed_goal_angle_deg = args_cli.goal_angle
 
     # randomly sample a seed if seed = -1
     if args_cli.seed == -1:

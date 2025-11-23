@@ -32,6 +32,7 @@ parser.add_argument(
     help="When no checkpoint provided, use the last saved model. Otherwise use the best saved model.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--goal_angle", type=float, default=None, help="Fixed goal angle in degrees (if not specified, uses advancing goal).")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -77,6 +78,8 @@ def main():
     env_cfg = parse_env_cfg(
         args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
     )
+    if args_cli.goal_angle is not None:
+        env_cfg.fixed_goal_angle_deg = args_cli.goal_angle
     agent_cfg = load_cfg_from_registry(args_cli.task, "rl_games_cfg_entry_point")
 
     # specify directory for logging experiments

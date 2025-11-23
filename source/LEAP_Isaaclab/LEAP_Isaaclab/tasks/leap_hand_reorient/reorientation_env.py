@@ -61,12 +61,18 @@ class ReorientationEnv(DirectRLEnv):
 
         # track goal resets
         self.reset_goal_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # track if goal has been reached in fixed mode (to terminate episode)
+        self.goal_reached_fixed_mode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # used to compare object position
         self.in_hand_pos = self.object.data.default_root_state[:, 0:3].clone()
         self.in_hand_pos[:, 2] += 0.01
         
         # continuous z-axis rotation parameters
         self.target_z_angle = torch.full((self.num_envs,), 2 * math.pi / self.cfg.z_rotation_steps, dtype=torch.float, device=self.device)
+        # fixed goal angle (in radians) if specified, None otherwise
+        self.fixed_goal_angle_rad = None
+        if hasattr(self.cfg, 'fixed_goal_angle_deg') and self.cfg.fixed_goal_angle_deg is not None:
+            self.fixed_goal_angle_rad = math.radians(self.cfg.fixed_goal_angle_deg)
         
         # default goal positions and rotations
         self.goal_rot = torch.zeros((self.num_envs, 4), dtype=torch.float, device=self.device)
@@ -100,6 +106,12 @@ class ReorientationEnv(DirectRLEnv):
         self.x_unit_tensor = torch.tensor([1, 0, 0], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
         self.y_unit_tensor = torch.tensor([0, 1, 0], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
         self.z_unit_tensor = torch.tensor([0, 0, 1], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
+        
+        # If fixed angle is specified, set goal rotation to that angle from the start
+        # (markers will be updated during reset after scene is set up)
+        if self.fixed_goal_angle_rad is not None:
+            fixed_angle_tensor = torch.full((self.num_envs,), self.fixed_goal_angle_rad, dtype=torch.float, device=self.device)
+            self.goal_rot = quat_from_angle_axis(fixed_angle_tensor, self.z_unit_tensor)
 
         self.randomized_episode_lengths = torch.randint(int(self.cfg.min_episode_length_s / (self.cfg.sim.dt * self.cfg.decimation)), self.max_episode_length + 1, (self.num_envs,), dtype=torch.int32, device=self.device)
 
@@ -192,9 +204,26 @@ class ReorientationEnv(DirectRLEnv):
         )
 
     def _update_continuous_z_rotation(self, goal_env_ids):        
-        # create quaternion for z-axis rotation
-        add_rot = quat_from_angle_axis(self.target_z_angle, self.z_unit_tensor)
-        self.goal_rot[goal_env_ids] = quat_mul(add_rot[goal_env_ids], self.goal_rot[goal_env_ids])
+        # Ensure goal_env_ids is 1D tensor (handle case when squeeze removes all dimensions)
+        if goal_env_ids.dim() == 0:
+            goal_env_ids = goal_env_ids.unsqueeze(0)
+        goal_env_ids = goal_env_ids.long()  # Ensure integer type for indexing
+        
+        if len(goal_env_ids) == 0:
+            # update goal markers even if no envs to update
+            goal_pos = self.goal_pos + self.scene.env_origins
+            self.goal_markers.visualize(goal_pos, self.goal_rot)
+            return
+            
+        if self.fixed_goal_angle_rad is not None:
+            # Fixed angle mode: set goal rotation to the specified angle
+            fixed_angle_tensor = torch.full((len(goal_env_ids),), self.fixed_goal_angle_rad, dtype=torch.float, device=self.device)
+            fixed_rot = quat_from_angle_axis(fixed_angle_tensor, self.z_unit_tensor[goal_env_ids])
+            self.goal_rot[goal_env_ids] = fixed_rot
+        else:
+            # Advancing mode: increment goal rotation by target_z_angle
+            add_rot = quat_from_angle_axis(self.target_z_angle, self.z_unit_tensor)
+            self.goal_rot[goal_env_ids] = quat_mul(add_rot[goal_env_ids], self.goal_rot[goal_env_ids])
         
         # update goal markers
         goal_pos = self.goal_pos + self.scene.env_origins
@@ -268,10 +297,19 @@ class ReorientationEnv(DirectRLEnv):
             adr_criteria = ((self.consecutive_successes / self.cfg.z_rotation_steps) / (self.randomized_episode_lengths.float().mean() * self.cfg.sim.dt * self.cfg.decimation)).float().mean()
             self.extras["log"]["adr_criteria"] = adr_criteria
 
-        # update goal if the goal has been reached
+        # update goal if the goal has been reached (only in advancing mode)
         goal_env_ids = self.reset_goal_buf.nonzero(as_tuple=False).squeeze(-1)
+        # Ensure goal_env_ids is 1D tensor (handle case when squeeze removes all dimensions)
+        if goal_env_ids.dim() == 0:
+            goal_env_ids = goal_env_ids.unsqueeze(0)
         if len(goal_env_ids) > 0:
-            self._update_continuous_z_rotation(goal_env_ids)
+            if self.fixed_goal_angle_rad is None:
+                # Only advance goal in non-fixed mode
+                self._update_continuous_z_rotation(goal_env_ids)
+            else:
+                # In fixed mode, mark that goal has been reached (will terminate episode)
+                self.goal_reached_fixed_mode[goal_env_ids] = True
+            # Reset the goal buffer
             self.reset_goal_buf[goal_env_ids] = 0
 
         return total_reward
@@ -290,6 +328,10 @@ class ReorientationEnv(DirectRLEnv):
         flipped = (torch.abs(diff) < 0.5)
 
         out_of_reach = out_of_reach | flipped
+        
+        # In fixed mode, terminate when goal is reached
+        if self.fixed_goal_angle_rad is not None:
+            out_of_reach = out_of_reach | self.goal_reached_fixed_mode
 
         return out_of_reach, time_out
 
@@ -369,6 +411,9 @@ class ReorientationEnv(DirectRLEnv):
 
         self.hand.set_joint_position_target(dof_pos, env_ids=env_ids)
         self.hand.write_joint_state_to_sim(dof_pos, dof_vel, env_ids=env_ids)
+        
+        # Reset goal reached flag for fixed mode
+        self.goal_reached_fixed_mode[env_ids] = False
 
         if self.cfg.enable_adr and len(env_ids) > 0:
             adr_utils.update_adr_obs_act_noise(self, env_ids)
@@ -401,12 +446,21 @@ class ReorientationEnv(DirectRLEnv):
 
         # initialize goal rotation
         self._compute_intermediate_values()
-        r,p,y = euler_xyz_from_quat(self.object_rot[env_ids])
-        r[:].fill_(0.0)
-        p[:].fill_(0.0)
-        self.goal_rot[env_ids] = quat_from_euler_xyz(r,p,y)
-
-        self._update_continuous_z_rotation(env_ids)
+        
+        if self.fixed_goal_angle_rad is not None:
+            # Fixed angle mode: set goal to absolute angle from identity
+            fixed_angle_tensor = torch.full((len(env_ids),), self.fixed_goal_angle_rad, dtype=torch.float, device=self.device)
+            self.goal_rot[env_ids] = quat_from_angle_axis(fixed_angle_tensor, self.z_unit_tensor[env_ids])
+            # Update goal markers to show the target pose
+            goal_pos = self.goal_pos + self.scene.env_origins
+            self.goal_markers.visualize(goal_pos, self.goal_rot)
+        else:
+            # Advancing mode: start from object's current yaw
+            r,p,y = euler_xyz_from_quat(self.object_rot[env_ids])
+            r[:].fill_(0.0)
+            p[:].fill_(0.0)
+            self.goal_rot[env_ids] = quat_from_euler_xyz(r,p,y)
+            self._update_continuous_z_rotation(env_ids)
 
     def _compute_intermediate_values(self):
         # data for hand
