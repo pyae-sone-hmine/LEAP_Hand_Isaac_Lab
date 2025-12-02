@@ -78,8 +78,9 @@ def main():
     env_cfg = parse_env_cfg(
         args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
     )
+    # Configure goal angle mode
     if args_cli.goal_angle is not None:
-        env_cfg.fixed_goal_angle_deg = args_cli.goal_angle
+        env_cfg.dynamic_goal_mode = True  # Enable dynamic mode for UI control
     agent_cfg = load_cfg_from_registry(args_cli.task, "rl_games_cfg_entry_point")
 
     # specify directory for logging experiments
@@ -114,6 +115,20 @@ def main():
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    # Set up dynamic goal control UI if goal_angle is specified
+    if args_cli.goal_angle is not None:
+        try:
+            from LEAP_Isaaclab.ui_extension import set_env_reference, create_goal_angle_ui
+            # Get the unwrapped environment to access set_goal_angle methods
+            unwrapped_env = env.unwrapped
+            set_env_reference(unwrapped_env)
+            # Set initial goal angle
+            unwrapped_env.set_goal_angle_deg(args_cli.goal_angle)
+            create_goal_angle_ui()
+            print(f"[INFO] Dynamic goal control UI enabled. Initial angle: {args_cli.goal_angle}°")
+        except Exception as e:
+            print(f"[WARN] Could not create goal angle UI: {e}")
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):

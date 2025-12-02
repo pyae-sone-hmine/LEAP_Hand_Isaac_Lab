@@ -38,6 +38,10 @@ class ReorientationEnv(DirectRLEnv):
 
         self.num_hand_dofs = self.hand.num_joints
 
+        # Dynamic goal angle control (in radians) - can be updated via UI
+        self.current_goal_angle_rad = 0.0  # Default to 0 radians
+        self.dynamic_goal_mode = getattr(self.cfg, 'dynamic_goal_mode', False)
+
         # buffers for position targets
         self.hand_dof_targets = torch.zeros((self.num_envs, self.num_hand_dofs), dtype=torch.float, device=self.device)
         self.prev_targets = torch.zeros((self.num_envs, self.num_hand_dofs), dtype=torch.float, device=self.device)
@@ -103,12 +107,6 @@ class ReorientationEnv(DirectRLEnv):
         self.x_unit_tensor = torch.tensor([1, 0, 0], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
         self.y_unit_tensor = torch.tensor([0, 1, 0], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
         self.z_unit_tensor = torch.tensor([0, 0, 1], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
-        
-        # If fixed angle is specified, set goal rotation to that angle from the start
-        # (markers will be updated during reset after scene is set up)
-        if self.cfg.fixed_goal_angle_rad is not None:
-            fixed_angle_tensor = torch.full((self.num_envs,), self.cfg.fixed_goal_angle_rad, dtype=torch.float, device=self.device)
-            self.goal_rot = quat_from_angle_axis(fixed_angle_tensor, self.z_unit_tensor)
 
         self.randomized_episode_lengths = torch.randint(int(self.cfg.min_episode_length_s / (self.cfg.sim.dt * self.cfg.decimation)), self.max_episode_length + 1, (self.num_envs,), dtype=torch.int32, device=self.device)
 
@@ -164,28 +162,14 @@ class ReorientationEnv(DirectRLEnv):
 
         self.actions = torch.clamp(self.actions, -1.0, 1.0)
 
-    def set_fixed_goal_angle_deg(self, angle_deg: float):
-        """Set a new fixed goal angle (degrees) at runtime and clear 'goal reached' flags."""
-        self.fixed_goal_angle_rad = math.radians(angle_deg)
-
-        # Clear goal reached state so envs can move again
-        self.goal_reached_fixed_mode[:] = False
-
-        # Recompute goal_rot for all envs (absolute angle about z)
-        angle_tensor = torch.full((self.num_envs,), self.fixed_goal_angle_rad, dtype=torch.float, device=self.device)
-        self.goal_rot = quat_from_angle_axis(angle_tensor, self.z_unit_tensor)
-
-        # Update visualization markers
-        goal_pos = self.goal_pos + self.scene.env_origins
-        self.goal_markers.visualize(goal_pos, self.goal_rot)
 
     def _apply_action(self) -> None:
         # Clone to avoid modifying original actions
         actions = self.actions.clone()
 
-        # For envs that have reached the goal in fixed mode, freeze actions at zero
+        # For envs that have reached the goal in dynamic mode, freeze actions at zero
         # so targets stay at previous values.
-        if self.fixed_goal_angle_rad is not None:
+        if self.dynamic_goal_mode:
             frozen_envs = self.goal_reached_fixed_mode
             if torch.any(frozen_envs):
                 actions[frozen_envs] = 0.0
@@ -236,11 +220,10 @@ class ReorientationEnv(DirectRLEnv):
             self.goal_markers.visualize(goal_pos, self.goal_rot)
             return
             
-        if self.cfg.fixed_goal_angle_rad is not None:
-            # Fixed angle mode: set goal rotation to the specified angle
-            fixed_angle_tensor = torch.full((len(goal_env_ids),), self.cfg.fixed_goal_angle_rad, dtype=torch.float, device=self.device)
-            fixed_rot = quat_from_angle_axis(fixed_angle_tensor, self.z_unit_tensor[goal_env_ids])
-            self.goal_rot[goal_env_ids] = fixed_rot
+        if self.dynamic_goal_mode:
+            # Dynamic mode: set goal rotation to the current dynamic angle
+            angle_tensor = torch.full((len(goal_env_ids),), self.current_goal_angle_rad, dtype=torch.float, device=self.device)
+            self.goal_rot[goal_env_ids] = quat_from_angle_axis(angle_tensor, self.z_unit_tensor[goal_env_ids])
         else:
             # Advancing mode: increment goal rotation by target_z_angle
             add_rot = quat_from_angle_axis(self.target_z_angle, self.z_unit_tensor)
@@ -318,18 +301,18 @@ class ReorientationEnv(DirectRLEnv):
             adr_criteria = ((self.consecutive_successes / self.cfg.z_rotation_steps) / (self.randomized_episode_lengths.float().mean() * self.cfg.sim.dt * self.cfg.decimation)).float().mean()
             self.extras["log"]["adr_criteria"] = adr_criteria
 
-        # update goal if the goal has been reached (only in advancing mode)
+        # update goal if the goal has been reached
         goal_env_ids = self.reset_goal_buf.nonzero(as_tuple=False).squeeze(-1)
         # Ensure goal_env_ids is 1D tensor (handle case when squeeze removes all dimensions)
         if goal_env_ids.dim() == 0:
             goal_env_ids = goal_env_ids.unsqueeze(0)
         if len(goal_env_ids) > 0:
-            if self.cfg.fixed_goal_angle_rad is None:
-                # Only advance goal in non-fixed mode
-                self._update_continuous_z_rotation(goal_env_ids)
-            else:
-                # In fixed mode, mark that goal has been reached (will terminate episode)
+            if self.dynamic_goal_mode:
+                # In dynamic mode, mark that goal has been reached (pause until new goal from UI)
                 self.goal_reached_fixed_mode[goal_env_ids] = True
+            else:
+                # In advancing mode, advance to next goal
+                self._update_continuous_z_rotation(goal_env_ids)
             # Reset the goal buffer
             self.reset_goal_buf[goal_env_ids] = 0
 
@@ -349,10 +332,6 @@ class ReorientationEnv(DirectRLEnv):
         flipped = (torch.abs(diff) < 0.5)
 
         out_of_reach = out_of_reach | flipped
-        
-        # # In fixed mode, terminate when goal is reached
-        # if self.cfg.fixed_goal_angle_rad is not None:
-        #     out_of_reach = out_of_reach | self.goal_reached_fixed_mode
 
         return out_of_reach, time_out
 
@@ -468,11 +447,11 @@ class ReorientationEnv(DirectRLEnv):
         # initialize goal rotation
         self._compute_intermediate_values()
         
-        if self.cfg.fixed_goal_angle_rad is not None:
-            # Fixed angle mode: set goal to absolute angle from identity
-            fixed_angle_tensor = torch.full((len(env_ids),), self.cfg.fixed_goal_angle_rad, dtype=torch.float, device=self.device)
-            self.goal_rot[env_ids] = quat_from_angle_axis(fixed_angle_tensor, self.z_unit_tensor[env_ids])
-            # Update goal markers to show the target pose
+        if self.dynamic_goal_mode:
+            # Dynamic mode: set goal to current dynamic angle
+            angle_tensor = torch.full((len(env_ids),), self.current_goal_angle_rad, dtype=torch.float, device=self.device)
+            self.goal_rot[env_ids] = quat_from_angle_axis(angle_tensor, self.z_unit_tensor[env_ids])
+            # Update goal markers
             goal_pos = self.goal_pos + self.scene.env_origins
             self.goal_markers.visualize(goal_pos, self.goal_rot)
         else:
@@ -510,6 +489,27 @@ class ReorientationEnv(DirectRLEnv):
 
         print(f"sim2real_indices: {sim2real_idx_16}")
         print(f"real2sim_indices: {real2sim_idx_16}")
+
+    def set_goal_angle_rad(self, angle_rad: float):
+        """Set the goal angle dynamically (in radians). Called from UI slider."""
+        self.current_goal_angle_rad = angle_rad
+        # Update goal rotation for all environments
+        angle_tensor = torch.full((self.num_envs,), angle_rad, dtype=torch.float, device=self.device)
+        self.goal_rot = quat_from_angle_axis(angle_tensor, self.z_unit_tensor)
+        # Update goal markers
+        goal_pos = self.goal_pos + self.scene.env_origins
+        self.goal_markers.visualize(goal_pos, self.goal_rot)
+        # Reset goal reached flag so envs continue pursuing the new goal
+        self.goal_reached_fixed_mode.fill_(False)
+        print(f"[ReorientationEnv] Goal angle set to {math.degrees(angle_rad):.1f} degrees ({angle_rad:.3f} rad)")
+
+    def set_goal_angle_deg(self, angle_deg: float):
+        """Set the goal angle dynamically (in degrees). Convenience wrapper."""
+        self.set_goal_angle_rad(math.radians(angle_deg))
+
+    def get_goal_angle_deg(self) -> float:
+        """Get the current goal angle in degrees."""
+        return math.degrees(self.current_goal_angle_rad)
             
 @torch.jit.script
 def scale(x, lower, upper):
