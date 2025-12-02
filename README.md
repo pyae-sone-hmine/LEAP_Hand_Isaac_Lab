@@ -22,17 +22,17 @@ python -m pip install -e source/LEAP_Isaaclab
 ## Training a policy
 Once in the `LEAP_Isaaclab` parent directory in your terminal, you can train a policy by entering the following command into the terminal. Note that the policies in this repository are tested with the `rl_games` library.
 
-You can train a policy using the following command:
+You can train the 1D rotation policy using the following command:
 ```bash
-python scripts/rl_games/train.py --task Isaac-Reorient-Cube-Leap --headless
+python scripts/rl_games/train.py --task Reorient_Cube_1D --headless
 ```
 
 And visualize infinite spinning with the policy with the following command:
 ```bash
-python scripts/rl_games/play.py --task Isaac-Reorient-Cube-Leap --num_envs 1
+python scripts/rl_games/play.py --task Reorient_Cube_1D --num_envs 1
 ```
 
 Or to a goal position using:
 ```bash
-python scripts/rl_games/play.py --task Isaac-Reorient-Cube-Leap --num_envs 1 --goal_angle 0
+python scripts/rl_games/play.py --task Reorient_Cube_1D --num_envs 1 --goal_angle 0
 ```
