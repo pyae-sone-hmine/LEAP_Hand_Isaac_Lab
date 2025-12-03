@@ -19,6 +19,28 @@ python -m pip install -e source/LEAP_Isaaclab
 ```
 
 
+## Project Structure
+```
+source/LEAP_Isaaclab/LEAP_Isaaclab/tasks/
+├── reorient_1dbi/          # 1-axis rotation task
+│   ├── __init__.py
+│   ├── env_cfg.py
+│   └── agent_cfg.py
+├── reorient_1dgoal/          # Bi-directional rotation task
+│   ├── __init__.py
+│   ├── env_cfg.py
+│   └── agent_cfg.py
+└── reorient_3d/          # Full 3D reorientation task
+    ├── __init__.py
+    ├── env_cfg.py
+    └── agent_cfg.py
+
+logs/rl_games/
+├── reorient_1dbi/          # 1D policy checkpoints
+├── reorient_1dgoal/          # BI policy checkpoints
+└── reorient_3d/          # 3D policy checkpoints
+```
+
 ## Training a policy
 Once in the `LEAP_Isaaclab` parent directory in your terminal, you can train a policy by entering the following command into the terminal. Note that the policies in this repository are tested with the `rl_games` library.
 
