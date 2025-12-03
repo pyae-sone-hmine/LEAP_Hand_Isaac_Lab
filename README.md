@@ -44,6 +44,8 @@ logs/rl_games/
 ## Training a policy
 Once in the `LEAP_Isaaclab` parent directory in your terminal, you can train a policy by entering the following command into the terminal. Note that the policies in this repository are tested with the `rl_games` library.
 
+We have 3 tasks: - Reorient_Cube_1D: Original policy from LEAP: Just spinning the cube infinitly, with a environmental pause at goal rotation that is not handled by the policy (policy is not goal conditioned) - Reorient_Cube_1Dbi: A policy that is goal-conditioned and trained to achieve a goal position and wait, and then wait for a new goal. Policy does it all on its own and is able to turn the cube in both directions as a result. - Reorient_Cube_3D: A policy for 3D reorientation using similar logic as 1Dbi
+
 You can train the 1D rotation policy using the following command:
 ```bash
 python scripts/rl_games/train.py --task Reorient_Cube_1D --headless

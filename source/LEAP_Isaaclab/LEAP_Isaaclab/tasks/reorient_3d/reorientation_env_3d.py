@@ -491,7 +491,7 @@ class ReorientationEnv3D(DirectRLEnv):
             (len(env_ids), 3),
             self.device,
         )
-        self.goal_rot[env_ids] = quat_from_euler_xyz(angles)
+        self.goal_rot[env_ids] = quat_from_euler_xyz(angles[:, 0], angles[:, 1], angles[:, 2])
 
         # update goal markers
         goal_pos = self.goal_pos + self.scene.env_origins
@@ -535,7 +535,7 @@ class ReorientationEnv3D(DirectRLEnv):
                 (len(env_indices), 3),
                 self.device,
             )
-            self.goal_rot[env_indices] = quat_from_euler_xyz(new_angles)
+            self.goal_rot[env_indices] = quat_from_euler_xyz(new_angles[:, 0], new_angles[:, 1], new_angles[:, 2])
 
             # Reset success flags for these envs to allow new bonus
             self.has_succeeded[env_indices] = False
