@@ -22,7 +22,7 @@ python -m pip install -e source/LEAP_Isaaclab
 ## Project Structure
 ```
 source/LEAP_Isaaclab/LEAP_Isaaclab/tasks/
-├── reorient_1dbi/          # 1-axis rotation task
+├── reorient_1dbi2/          # 1-axis rotation task
 │   ├── __init__.py
 │   ├── env_cfg.py
 │   └── agent_cfg.py
@@ -36,7 +36,7 @@ source/LEAP_Isaaclab/LEAP_Isaaclab/tasks/
     └── agent_cfg.py
 
 logs/rl_games/
-├── reorient_1dbi/          # 1D policy checkpoints
+├── reorient_1dbi2/          # 1D policy checkpoints
 ├── reorient_1dgoal/          # BI policy checkpoints
 └── reorient_3d/          # 3D policy checkpoints
 ```
@@ -44,7 +44,7 @@ logs/rl_games/
 ## Training a policy
 Once in the `LEAP_Isaaclab` parent directory in your terminal, you can train a policy by entering the following command into the terminal. Note that the policies in this repository are tested with the `rl_games` library.
 
-We have 3 tasks: - Reorient_Cube_1D: Original policy from LEAP: Just spinning the cube infinitly, with a environmental pause at goal rotation that is not handled by the policy (policy is not goal conditioned) - Reorient_Cube_1Dbi: A policy that is goal-conditioned and trained to achieve a goal position and wait, and then wait for a new goal. Policy does it all on its own and is able to turn the cube in both directions as a result. - Reorient_Cube_3D: A policy for 3D reorientation using similar logic as 1Dbi
+We have 3 tasks: - Reorient_Cube_1D: Original policy from LEAP: Just spinning the cube infinitly, with a environmental pause at goal rotation that is not handled by the policy (policy is not goal conditioned) - Reorient_Cube_1Dbi2: A policy that is goal-conditioned and trained to achieve a goal position and wait, and then wait for a new goal. Policy does it all on its own and is able to turn the cube in both directions as a result. - Reorient_Cube_3D: A policy for 3D reorientation using similar logic as 1Dbi2
 
 You can train the 1D rotation policy using the following command:
 ```bash
