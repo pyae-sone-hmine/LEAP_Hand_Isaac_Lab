@@ -38,6 +38,8 @@ class ReorientationEnvBi(DirectRLEnv):
         self.num_hand_dofs = self.hand.num_joints
 
         # Single-goal control: track a fixed goal angle per episode.
+        # The old dynamic/stepping logic is removed; this scalar is only
+        # used as a convenience for UI overrides.
         self.current_goal_angle_rad = 0.0  # Default to 0 radians
 
         # buffers for position targets
@@ -108,9 +110,6 @@ class ReorientationEnvBi(DirectRLEnv):
         self.object_angvel = torch.zeros((self.num_envs, 3), dtype=torch.float, device=self.device)
         self.object_rot = torch.zeros((self.num_envs, 4), dtype=torch.float, device=self.device)
         self.object_rot[:, 0] = 1.0
-
-        # Previous rotation distance for progress based rotation reward
-        self.prev_rot_dist = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
         # initialize history tensor
         # per-timestep obs size = observation_space // hist_len
@@ -210,6 +209,9 @@ class ReorientationEnvBi(DirectRLEnv):
         # Clone to avoid modifying original actions
         actions = self.actions.clone()
 
+        # No environment-side freezing or stepping on goal reach.
+        # The policy is always in control and must learn to stop at the goal.
+
         if self.cfg.action_type == "relative":
             targets = self.prev_targets[:, self.actuated_dof_indices] + self.cfg.act_moving_average * actions
             self.cur_targets[:, self.actuated_dof_indices] = saturate(
@@ -247,12 +249,11 @@ class ReorientationEnvBi(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         """
-        Observation includes:
-        - normalized hand DOF positions (16)
-        - current joint targets (16)
-        - object orientation quat (4)
-        - goal orientation quat (4)
-        - object position relative to in_hand_pos (3) - NEW for stability
+        Observation now includes:
+        - normalized hand DOF positions
+        - current joint targets
+        - object orientation (quat)
+        - goal orientation (quat)
         """
         # normalize joint positions to [-1, 1]
         frame = unscale(
@@ -272,10 +273,6 @@ class ReorientationEnvBi(DirectRLEnv):
         # condition on goal orientation
         per_timestep_features.append(self.goal_rot)
 
-        # NEW: object position relative to in_hand_pos (tells policy where cube is drifting)
-        object_pos_relative = self.object_pos - self.in_hand_pos
-        per_timestep_features.append(object_pos_relative)
-
         frame = torch.cat(per_timestep_features, dim=-1)
 
         # history buffer
@@ -286,11 +283,10 @@ class ReorientationEnvBi(DirectRLEnv):
         return {"policy": obs.float()}
 
     def _get_rewards(self) -> torch.Tensor:
-        """Compute rewards for the current step."""
-        # Penalties based on current targets and torques
-        pose_diff_penalty = (
-            (self.cur_targets[:, self.actuated_dof_indices] - self.override_default_joint_pos) ** 2
-        ).sum(-1)
+        """Compute rewards using 1Dbi's structure with checkpoint bonuses."""
+        
+        # Compute penalties like 1Dbi
+        pose_diff_penalty = ((self.cur_targets[:, self.actuated_dof_indices] - self.override_default_joint_pos) ** 2).sum(-1)
         torque_penalty = (self.hand.data.computed_torque ** 2).sum(-1)
 
         (
@@ -317,7 +313,6 @@ class ReorientationEnvBi(DirectRLEnv):
             self.actions,
             pose_diff_penalty,
             torque_penalty,
-            self.prev_rot_dist,
             # Reward scales
             self.cfg.dist_reward_scale,
             self.cfg.rot_reward_scale,
@@ -326,44 +321,88 @@ class ReorientationEnvBi(DirectRLEnv):
             self.cfg.pose_diff_penalty_scale,
             self.cfg.torque_penalty_scale,
             self.cfg.angvel_penalty_scale,
-            self.cfg.object_linvel_penalty_scale,
-            self.cfg.fingertip_dist_penalty_scale,
-            # Success and failure parameters
+            # Success/failure params
             self.cfg.fall_dist,
             self.cfg.fall_penalty,
             self.cfg.success_tolerance,
             self.cfg.av_factor,
+            self.cfg.fingertip_dist_penalty_scale,
+            self.cfg.centering_sigma,
+            self.cfg.centering_reward_scale,
         )
 
-        # Store rotation distance for next-step progress computation
-        self.prev_rot_dist = rot_dist.detach()
-
-        # One time completion bonus when a new goal is reached
+        # === CHECKPOINT BONUS LOGIC ===
+        # Get current z-angle of object
+        _, _, current_z_angle = euler_xyz_from_quat(self.object_rot)
+        
+        # Calculate progress toward goal (signed, direction-aware)
+        # progress = how far we've rotated from start toward the goal direction
+        progress = current_z_angle - self.start_z_angle
+        
+        # Normalize progress to [-pi, pi]
+        progress = torch.atan2(torch.sin(progress), torch.cos(progress))
+        
+        # Check if rotating in the right direction (same sign as goal)
+        goal_sign = torch.sign(self.goal_angle_rad)
+        progress_sign = torch.sign(progress)
+        correct_direction = (goal_sign == progress_sign) | (self.goal_angle_rad == 0)
+        
+        # Calculate how many checkpoints should be reached based on progress
+        # Only count progress in the correct direction
+        progress_toward_goal = torch.where(correct_direction, torch.abs(progress), torch.zeros_like(progress))
+        
+        # Number of checkpoints reached = floor(progress / checkpoint_step)
+        # But cap at (num_checkpoints - 1) for intermediate checkpoints
+        # The final checkpoint is handled by the final goal bonus
+        checkpoints_now = torch.floor(progress_toward_goal / self.checkpoint_step_rad).to(torch.int32)
+        checkpoints_now = torch.clamp(checkpoints_now, min=0)
+        checkpoints_now = torch.minimum(checkpoints_now, self.num_checkpoints - 1)
+        
+        # Calculate newly crossed checkpoints
+        new_checkpoints = checkpoints_now - self.checkpoints_reached
+        new_checkpoints = torch.clamp(new_checkpoints, min=0)  # Only count forward progress
+        
+        # Apply checkpoint bonuses for intermediate checkpoints
+        checkpoint_reward = new_checkpoints.float() * self.cfg.checkpoint_bonus
+        total_reward = total_reward + checkpoint_reward
+        
+        # Update checkpoints reached
+        self.checkpoints_reached = torch.maximum(self.checkpoints_reached, checkpoints_now)
+        
+        # === FINAL GOAL BONUS ===
+        # Apply final goal bonus when success is achieved (reaches final checkpoint)
         total_reward = torch.where(new_success, total_reward + self.cfg.reach_goal_bonus, total_reward)
 
-        # Update success flags and goal switching
+        # Update has_succeeded flag when new success occurs
         self.has_succeeded = torch.logical_or(self.has_succeeded, new_success)
+
+        # Goal switching logic: handle hold phases and new goals
         self._update_goals(new_success)
 
         # Logging
-        self.extras["log"]["consecutive_successes"] = (
-            self.consecutive_successes.mean() / max(self.cfg.z_rotation_steps, 1)
-        )
+        self.extras["log"]["consecutive_successes"] = self.consecutive_successes.mean() / max(self.cfg.z_rotation_steps, 1)
         self.extras["log"]["goals_per_episode"] = self.goals_completed_this_episode.float().mean()
         self.extras["log"]["avg_hold_remaining"] = self.hold_counter.float().mean()
         self.extras["log"]["rot_dist"] = rot_dist.mean()
         self.extras["log"]["pose_diff_penalty"] = pose_diff_penalty.mean()
         self.extras["log"]["torque_info"] = torque_penalty.mean()
-        self.extras["log"]["object_linvel"] = torch.norm(self.object_linvel, p=2, dim=-1).mean()
-        self.extras["log"]["object_angvel"] = torch.norm(self.object_angvel, p=2, dim=-1).mean()
-        self.extras["log"]["object_pos_drift"] = torch.norm(
-            self.object_pos - self.in_hand_pos, p=2, dim=-1
-        ).mean()
+        self.extras["log"]['object_linvel'] = torch.norm(self.object_linvel, p=1, dim=-1).mean()
+        self.extras["log"]['roll'] = self.object_angvel[:, 0].mean()
+        self.extras["log"]['pitch'] = self.object_angvel[:, 1].mean()
+        self.extras["log"]['yaw'] = self.object_angvel[:, 2].mean()
+        self.extras["log"]["checkpoints_reached"] = self.checkpoints_reached.float().mean()
+        self.extras["log"]["checkpoint_reward"] = checkpoint_reward.mean()
 
-        # Episode length statistics
+        # Log episode length statistics
         self.extras["log"]["avg_episode_length_s"] = (
             self.randomized_episode_lengths.float() * self.cfg.sim.dt * self.cfg.decimation
         ).mean()
+        self.extras["log"]["min_episode_length_s"] = (
+            self.randomized_episode_lengths.float() * self.cfg.sim.dt * self.cfg.decimation
+        ).min()
+        self.extras["log"]["max_episode_length_s"] = (
+            self.randomized_episode_lengths.float() * self.cfg.sim.dt * self.cfg.decimation
+        ).max()
 
         if self.cfg.enable_adr:
             adr_criteria = (
@@ -374,13 +413,14 @@ class ReorientationEnvBi(DirectRLEnv):
 
         return total_reward
 
-
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._compute_intermediate_values()
+        # reset when cube has fallen
         goal_dist = torch.norm(self.object_pos - self.in_hand_pos, p=2, dim=-1)
         out_of_reach = goal_dist >= self.cfg.fall_dist
         time_out = self.episode_length_buf >= self.randomized_episode_lengths - 1
 
+        # get z axis difference to terminate episode if a cube is flipped or not
         obj_z = matrix_from_quat(self.object_rot)[:, :, 2]
         goal_z = matrix_from_quat(self.goal_rot)[:, :, 2]
         diff = torch.sum(obj_z * goal_z, dim=1)
@@ -400,6 +440,7 @@ class ReorientationEnvBi(DirectRLEnv):
                 / (self.randomized_episode_lengths.float().mean() * self.cfg.sim.dt * self.cfg.decimation)
             ).float().mean()
 
+        # resets articulation and rigid body attributes
         super()._reset_idx(env_ids)
 
         self.randomized_episode_lengths[env_ids] = torch.randint(
@@ -410,6 +451,7 @@ class ReorientationEnvBi(DirectRLEnv):
             device=self.device,
         )
 
+        # reset object
         object_default_state = self.object.data.default_root_state.clone()[env_ids]
         dof_pos = self.override_default_joint_pos[env_ids]
         dof_vel = self.hand.data.default_joint_vel[env_ids]
@@ -424,6 +466,7 @@ class ReorientationEnvBi(DirectRLEnv):
             y_rot = self.leap_adr.get_custom_param_value("object_spawn", "y_rotation")
             z_rot = self.leap_adr.get_custom_param_value("object_spawn", "z_rotation")
 
+            # Apply randomization
             if x_width > 0 or y_width > 0:
                 pos_noise = sample_uniform(-1.0, 1.0, (len(env_ids), 2), self.device)
                 object_default_state[:, 0] += pos_noise[:, 0] * x_width
@@ -458,12 +501,14 @@ class ReorientationEnvBi(DirectRLEnv):
         self.object.write_root_pose_to_sim(object_default_state[:, :7], env_ids)
         self.object.write_root_velocity_to_sim(object_default_state[:, 7:], env_ids)
 
+        # reset hand
         self.prev_targets[env_ids] = dof_pos
         self.cur_targets[env_ids] = dof_pos
         self.hand_dof_targets[env_ids] = dof_pos
         self.successes[env_ids] = 0
         self.reset_goal_buf[env_ids] = False
 
+        # Reset multi-goal tracking
         self.has_succeeded[env_ids] = False
         self.hold_counter[env_ids] = 0
         self.goals_completed_this_episode[env_ids] = 0
@@ -499,6 +544,7 @@ class ReorientationEnvBi(DirectRLEnv):
             else:
                 self.step_since_last_dr_change += 1
 
+            # update whether to apply wrench for the episode
             self.object_mass = self.object.root_physx_view.get_masses().to(device=self.device)
             self.apply_wrench = torch.where(
                 torch.rand(self.num_envs, device=self.device) <= self.cfg.wrench_prob_per_rollout,
@@ -506,9 +552,11 @@ class ReorientationEnvBi(DirectRLEnv):
                 False,
             )
 
+        # initialize goal rotation
         self._compute_intermediate_values()
 
         if self.cfg.dynamic_goal_mode:
+            # In inference mode: use a fixed goal angle (set from CLI/UI)
             angle_tensor = torch.full(
                 (len(env_ids),),
                 self.current_goal_angle_rad,
@@ -516,6 +564,7 @@ class ReorientationEnvBi(DirectRLEnv):
                 device=self.device,
             )
         else:
+            # Training mode: sample a random goal angle per environment
             angle_tensor = sample_uniform(
                 -math.pi,
                 math.pi,
@@ -525,26 +574,36 @@ class ReorientationEnvBi(DirectRLEnv):
 
         self.goal_rot[env_ids] = quat_from_angle_axis(angle_tensor, self.z_unit_tensor[env_ids])
 
+        # Initialize checkpoint tracking for these envs
+        # Store goal angle (signed) and compute number of checkpoints
         self.goal_angle_rad[env_ids] = angle_tensor
+        # Extract starting z-angle from current object orientation
         _, _, start_yaw = euler_xyz_from_quat(self.object_rot[env_ids])
         self.start_z_angle[env_ids] = start_yaw
+        # Compute number of checkpoints: ceil(abs(goal_angle) / checkpoint_step)
+        # Include the final goal as the last checkpoint
         self.num_checkpoints[env_ids] = torch.ceil(
             torch.abs(angle_tensor) / self.checkpoint_step_rad
         ).to(torch.int32)
+        # Reset checkpoints reached counter
         self.checkpoints_reached[env_ids] = 0
 
+        # update goal markers
         goal_pos = self.goal_pos + self.scene.env_origins
         self.goal_markers.visualize(goal_pos, self.goal_rot)
 
-        # Initialize previous rotation distance for progress based rotation reward
-        current_rot_dist = rotation_distance(self.object_rot[env_ids], self.goal_rot[env_ids])
-        self.prev_rot_dist[env_ids] = current_rot_dist.detach()
-
-
     def _update_goals(self, new_success: torch.Tensor):
-        """Handle goal switching logic."""
+        """
+        Handle goal switching logic:
+        - When new success occurs, start hold phase
+        - After hold phase, reset has_succeeded so policy can get bonus again
+        - In training mode, also sample new goal after hold phase
+        - Reset checkpoint tracking when new goal is sampled
+        """
+        # Start hold phase for newly successful envs
         newly_successful = new_success.bool()
         if newly_successful.any():
+            # Sample hold lengths for newly successful envs
             hold_lengths = torch.randint(
                 self.cfg.min_hold_steps,
                 self.cfg.max_hold_steps + 1,
@@ -559,13 +618,16 @@ class ReorientationEnvBi(DirectRLEnv):
                 self.goals_completed_this_episode,
             )
 
+        # Decrement hold counters
         self.hold_counter = torch.clamp(self.hold_counter - 1, min=0)
 
+        # Check for envs that finished holding and have succeeded
         finished_holding = (self.hold_counter == 0) & self.has_succeeded
         if finished_holding.any():
             env_indices = torch.where(finished_holding)[0]
 
             if not self.cfg.dynamic_goal_mode:
+                # Training mode: sample new goal angles
                 new_angles = sample_uniform(
                     -math.pi,
                     math.pi,
@@ -574,25 +636,28 @@ class ReorientationEnvBi(DirectRLEnv):
                 )
                 self.goal_rot[env_indices] = quat_from_angle_axis(new_angles, self.z_unit_tensor[env_indices])
 
+                # Reset checkpoint tracking for these envs
                 self.goal_angle_rad[env_indices] = new_angles
+                # Update start z-angle to current object orientation
                 _, _, current_yaw = euler_xyz_from_quat(self.object_rot[env_indices])
                 self.start_z_angle[env_indices] = current_yaw
+                # Compute number of checkpoints for new goal
                 self.num_checkpoints[env_indices] = torch.ceil(
                     torch.abs(new_angles) / self.checkpoint_step_rad
                 ).to(torch.int32)
+                # Reset checkpoints reached counter
                 self.checkpoints_reached[env_indices] = 0
 
+                # Update goal markers
                 goal_pos = self.goal_pos + self.scene.env_origins
                 self.goal_markers.visualize(goal_pos, self.goal_rot)
-                
-                # Reset previous rotation distance for environments with a new goal
-                current_rot_dist = rotation_distance(self.object_rot[env_indices], self.goal_rot[env_indices])
-                self.prev_rot_dist[env_indices] = current_rot_dist.detach()
 
+            # Reset success flags so policy can get bonus again for maintaining position
+            # This applies to both training and inference modes
             self.has_succeeded[env_indices] = False
 
-
     def _compute_intermediate_values(self):
+        # data for hand
         self.fingertip_pos = self.hand.data.body_pos_w[:, self.finger_bodies]
         self.fingertip_rot = self.hand.data.body_quat_w[:, self.finger_bodies]
         self.fingertip_pos -= self.scene.env_origins.repeat((1, self.num_fingertips)).reshape(
@@ -603,8 +668,9 @@ class ReorientationEnvBi(DirectRLEnv):
         self.hand_dof_pos = self.hand.data.joint_pos
         self.hand_dof_vel = self.hand.data.joint_vel
 
+        # data for object
         self.object_pos = self.object.data.root_pos_w - self.scene.env_origins
-        self.object_rot = self.object.data.root_quat_w
+        self.object_rot = self.object.data.root_quat_w  # w,x,y,z
         self.object_velocities = self.object.data.root_vel_w
         self.object_linvel = self.object.data.root_lin_vel_w
         self.object_angvel = self.object.data.root_ang_vel_w
@@ -619,12 +685,19 @@ class ReorientationEnvBi(DirectRLEnv):
         print(f"real2sim_indices: {real2sim_idx_16}")
 
     def set_goal_angle_rad(self, angle_rad: float):
-        """Set the goal angle dynamically (in radians)."""
+        """Set the goal angle dynamically (in radians). Called from UI slider / CLI."""
+
+        # Remember the requested angle
         self.current_goal_angle_rad = angle_rad
+
+        # Treat this as "fixed-goal" / inference mode
         self.cfg.dynamic_goal_mode = True
+
+        # Reset success / hold state so this new goal acts like a fresh target
         self.has_succeeded[:] = False
         self.hold_counter[:] = 0
 
+        # Update goal rotation for all environments
         angle_tensor = torch.full(
             (self.num_envs,),
             angle_rad,
@@ -633,17 +706,19 @@ class ReorientationEnvBi(DirectRLEnv):
         )
         self.goal_rot = quat_from_angle_axis(angle_tensor, self.z_unit_tensor)
 
+        # Update goal markers
         goal_pos = self.goal_pos + self.scene.env_origins
         self.goal_markers.visualize(goal_pos, self.goal_rot)
 
         print(f"[ReorientationEnvBi] Goal angle set to {math.degrees(angle_rad):.1f} degrees ({angle_rad:.3f} rad)")
 
+
     def set_goal_angle_deg(self, angle_deg: float):
-        """Set the goal angle dynamically (in degrees)."""
+        """Set the goal angle dynamically (in degrees). Convenience wrapper."""
         self.set_goal_angle_rad(math.radians(angle_deg))
 
     def get_goal_angle_deg(self) -> float:
-        """Get the current goal angle in degrees."""
+        """Get the current goal angle in degrees (for global overrides)."""
         return math.degrees(self.current_goal_angle_rad)
 
 
@@ -659,8 +734,9 @@ def unscale(x, lower, upper):
 
 @torch.jit.script
 def rotation_distance(object_rot, target_rot):
+    # Orientation alignment for the cube in hand and goal cube
     quat_diff = quat_mul(object_rot, quat_conjugate(target_rot))
-    return 2.0 * torch.asin(torch.clamp(torch.norm(quat_diff[:, 1:4], p=2, dim=-1), max=1.0))
+    return 2.0 * torch.asin(torch.clamp(torch.norm(quat_diff[:, 1:4], p=2, dim=-1), max=1.0))  # changed quat convention
 
 
 @torch.jit.script
@@ -681,7 +757,6 @@ def compute_rewards(
     actions: torch.Tensor,
     pose_diff_penalty: torch.Tensor,
     torque_penalty: torch.Tensor,
-    prev_rot_dist: torch.Tensor,
     # Reward scales
     dist_reward_scale: float,
     rot_reward_scale: float,
@@ -690,41 +765,60 @@ def compute_rewards(
     pose_diff_penalty_scale: float,
     torque_penalty_scale: float,
     angvel_penalty_scale: float,
-    object_linvel_penalty_scale: float,
-    fingertip_dist_penalty_scale: float,
-    # Success and failure parameters
+    # Success/failure params
     fall_dist: float,
     fall_penalty: float,
     success_tolerance: float,
     av_factor: float,
+    fingertip_dist_penalty_scale: float,
+    centering_sigma: float,
+    centering_reward_scale: float,
 ):
-    """Progress based rotation reward plus simple shaping and penalties."""
-    # Distances
+    """
+    Compute rewards using 1Dbi's simpler structure:
+    - dist_rew: Keep cube in hand penalty
+    - rot_rew: Rotation alignment reward (1 / (rot_dist + eps))
+    - action_penalty: Action regularization
+    - pose_diff_penalty: Joint pose difference penalty
+    - angvel_penalty: Angular velocity penalty (hold still)
+    
+    NOTE: Checkpoint bonuses and final goal bonus are handled separately in _get_rewards.
+    """
+    # Distance from object to target position (for fall detection and cube-in-hand)
     goal_dist = torch.norm(object_pos - target_pos, p=2, dim=-1)
+
+    # Rotation distance to goal
     rot_dist = rotation_distance(object_rot, target_rot)
 
-    # Keep cube near the hand target position
-    dist_rew = goal_dist * dist_reward_scale
+    # === REWARD TERMS ===
+    
+    # 1. Distance reward: keep cube in hand (negative scale penalizes distance)
+    dist_rew = goal_dist * dist_reward_scale  # keeps the "don't fall" gradient
+    centering_rew = torch.exp(-goal_dist / centering_sigma) * centering_reward_scale  # adds "stay centered" incentive
 
-    # Progress based rotation reward: positive when moving closer to the target angle
-    rot_progress = prev_rot_dist - rot_dist
-    rot_rew = rot_progress * rot_reward_scale
+    # 2. Rotation reward: incentivize alignment with goal
+    rot_rew = 1.0 / (torch.abs(rot_dist) + rot_eps) * rot_reward_scale
 
-    # Regularization and stability terms
+    # 3. Action penalty: regularize actions
     action_penalty = torch.sum(actions ** 2, dim=-1)
+
+    # 4. Pose difference penalty: penalize deviation from default pose
     pose_rew = pose_diff_penalty * pose_diff_penalty_scale
+
+    # 5. Torque penalty
     torque_rew = torque_penalty * torque_penalty_scale
 
+    # 6. Angular velocity penalty: encourage holding still at goal
     ang_speed = torch.norm(object_angvel, p=2, dim=-1)
-    angvel_rew = ang_speed * angvel_penalty_scale
+    # Only penalize angular velocity when near the goal orientation
+    near_goal = rot_dist < 0.3  # within ~17 degrees
+    angvel_rew = torch.where(near_goal, ang_speed * angvel_penalty_scale, torch.zeros_like(ang_speed))
 
-    lin_speed = torch.norm(object_linvel, p=2, dim=-1)
-    linvel_rew = lin_speed * object_linvel_penalty_scale
 
-    fingertip_dist = torch.norm(fingertip_pos - object_pos.unsqueeze(1), p=2, dim=-1)
-    fingertip_dist = torch.mean(fingertip_dist, dim=-1)
-    fingertip_dist_rew = fingertip_dist * fingertip_dist_penalty_scale
+    fingertip_dist_penalty = torch.norm(fingertip_pos - object_pos.unsqueeze(1), p=2, dim=-1)
+    fingertip_dist_penalty = torch.mean(fingertip_dist_penalty, dim=-1)
 
+    # Total base reward
     reward = (
         dist_rew
         + rot_rew
@@ -732,21 +826,20 @@ def compute_rewards(
         + pose_rew
         + torque_rew
         + angvel_rew
-        + linvel_rew
-        + fingertip_dist_rew
+        + centering_rew
+        + fingertip_dist_penalty * fingertip_dist_penalty_scale
     )
 
-    # Success detection: close in angle and position with low velocities
+    # === SUCCESS DETECTION ===
+    # Success: rotation close to goal, position in hand, not spinning too fast
     angvel_threshold = 2.0  # rad/s
-    linvel_threshold = 0.1  # m/s
-
     success_condition = (
         (torch.abs(rot_dist) <= success_tolerance)
         & (goal_dist <= 0.025)
         & (ang_speed <= angvel_threshold)
-        & (lin_speed <= linvel_threshold)
     )
 
+    # NEW success: only true if we just reached goal and haven't succeeded before
     new_success = success_condition & (~has_succeeded)
     goal_resets = torch.where(new_success, torch.ones_like(reset_goal_buf), reset_buf)
 

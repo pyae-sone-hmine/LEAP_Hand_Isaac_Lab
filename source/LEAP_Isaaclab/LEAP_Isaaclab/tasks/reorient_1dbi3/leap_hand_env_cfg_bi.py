@@ -94,9 +94,9 @@ class LeapHandEnvCfgBi(DirectRLEnvCfg):
     hist_len = 3
     store_cur_actions = True
 
-    # 16 joint pos + 16 joint targets + 4 object quat + 4 goal quat + 3 object pos = 43 per timestep
-    # 43 * hist_len(3) = 129
-    observation_space = 129
+    # 16 joint pos + 16 joint targets + 4 object quat + 4 goal quat = 40 per timestep
+    # 40 * hist_len(3) = 120
+    observation_space = 120
     state_space = 0
 
     # simulation
@@ -161,29 +161,26 @@ class LeapHandEnvCfgBi(DirectRLEnvCfg):
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=8192, env_spacing=0.75, replicate_physics=False)
     
-    # reward scales (1Dbi3-style with enhanced stability)
+    # reward scales (1Dbi-style)
     z_rotation_steps = 16              # kept for ADR formulas
     dynamic_goal_mode = False          # When True, disable random goal sampling and use fixed goal angle from CLI/UI (inference mode)
-    
-    # Cube centering/stability rewards (INCREASED for stability)
-    dist_reward_scale = -15.0          # Keep cube in hand penalty (increased from -20)
-    object_linvel_penalty_scale = -0.5 # Penalty for object linear velocity (NEW)
-    
-    # Rotation rewards
+    dist_reward_scale = -50.0          # Keep cube in hand penalty
     rot_reward_scale = 2.0             # Rotation alignment reward
     rot_eps = 0.1                      # Epsilon for rotation reward denominator
-    
-    # Action/movement penalties (INCREASED for stability)
-    action_penalty_scale = -0.0003      # Action regularization (increased from -0.0005)
-    torque_penalty_scale = -0.0002       # Torque penalty
-    pose_diff_penalty_scale = -0.3     # Joint pose difference penalty
-    angvel_penalty_scale = -1.0        # Penalty on angular velocity (increased from -0.5)
-    fingertip_dist_penalty_scale = -0.5 # Penalty on fingertip distance (increased from -0.3)
+    action_penalty_scale = -0.0005     # Action regularization
+    torque_penalty_scale = -0.001        # Torque penalty (disabled)
+    pose_diff_penalty_scale = -0.1     # Joint pose difference penalty
+    angvel_penalty_scale = -0.5        # Penalty on angular velocity (hold still)
+    fingertip_dist_penalty_scale = -0.3 # Penalty on fingertip distance
     
     # Checkpoint reward configuration
     checkpoint_step_deg = 22.5         # Degrees per checkpoint (intermediate rewards)
     checkpoint_bonus = 50.0            # Bonus for reaching each intermediate checkpoint
     reach_goal_bonus = 250.0           # Larger bonus for reaching final goal
+    
+    # Centering
+    centering_reward_scale = 1.0      # Positive reward for being centered
+    centering_sigma = 0.02         # Stddev for centering Gaussian
     
     # Success/failure thresholds
     fall_penalty = -15.0               # Penalty for dropping cube
@@ -199,11 +196,11 @@ class LeapHandEnvCfgBi(DirectRLEnvCfg):
     max_hold_steps = 30                # Maximum steps to hold at goal before switching
 
     #adr config
-    enable_adr = True
+    enable_adr = False
     starting_adr_increments = 0 # 0 for no DR up to num_adr_increments for max DR
     min_rot_adr_coeff = 0.15  # ADR success threshold for domain randomization increases
     min_steps_for_dr_change = 240 * 4 # number of steps
-    obs_per_timestep = 43  # Updated: 16 + 16 + 4 + 4 + 3 = 43
+    obs_per_timestep = 32
     obs_timesteps = 3 # same as hist_len
 
     wrench_trigger_every = 90 # resample every this many policy steps
