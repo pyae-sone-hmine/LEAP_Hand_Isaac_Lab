@@ -1,5 +1,5 @@
 """
-Leap Inhand Manipulation environment.
+Leap Inhand Manipulation environment - Full 3D Reorientation.
 """
 
 import gymnasium as gym

@@ -1,13 +1,3 @@
-# --------------------------------------------------------
-# LEAP Hand: Low-Cost, Efficient, and Anthropomorphic Hand for Robot Learning
-# https://arxiv.org/abs/2309.06440
-# Copyright (c) 2025 Kenneth Shaw, Sri Anumakonda
-# Licensed under The MIT License [see LICENSE for details]
-# --------------------------------------------------------
-# Based on:
-# https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab_tasks/isaaclab_tasks/direct/inhand_manipulation/inhand_manipulation_env.py
-# --------------------------------------------------------
-
 from LEAP_Isaaclab.assets import LEAP_HAND_CFG
 
 import isaaclab.sim as sim_utils
@@ -170,22 +160,31 @@ class LeapHandEnvCfgBi(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=8192, env_spacing=0.75, replicate_physics=False)
-    # reward scales
-    z_rotation_steps = 16              # no longer used for stepping, kept for ADR formulas
-    dynamic_goal_mode = False          # When True, disable random goal sampling / switching and use fixed goal angle from CLI/UI (inference mode)
-    dist_reward_scale = -10.0
-    rot_reward_scale = 1.0
-    rot_eps = 0.1
-    action_penalty_scale = -0.0002
-    torque_penalty_scale = -0.0
-    ftip_penalty_scale = -1.0          # Penalty for fingertips being far from object
+    
+    # reward scales (1Dbi-style)
+    z_rotation_steps = 16              # kept for ADR formulas
+    dynamic_goal_mode = False          # When True, disable random goal sampling and use fixed goal angle from CLI/UI (inference mode)
+    dist_reward_scale = -20.0          # Keep cube in hand penalty
+    rot_reward_scale = 2.0             # Rotation alignment reward
+    rot_eps = 0.1                      # Epsilon for rotation reward denominator
+    action_penalty_scale = -0.0005     # Action regularization
+    torque_penalty_scale = -0.02        # Torque penalty (disabled)
+    pose_diff_penalty_scale = -0.3     # Joint pose difference penalty
     angvel_penalty_scale = -0.5        # Penalty on angular velocity (hold still)
-    reach_goal_bonus = 250
-    fall_penalty = -10
-    fall_dist = 0.07
-    success_tolerance = 0.2
-    av_factor = 0.1
-    action_type="relative" # absolute
+    fingertip_dist_penalty_scale = -0.3 # Penalty on fingertip distance
+    
+    # Checkpoint reward configuration
+    checkpoint_step_deg = 22.5         # Degrees per checkpoint (intermediate rewards)
+    checkpoint_bonus = 50.0            # Bonus for reaching each intermediate checkpoint
+    reach_goal_bonus = 250.0           # Larger bonus for reaching final goal
+    
+    # Success/failure thresholds
+    fall_penalty = -15.0               # Penalty for dropping cube
+    fall_dist = 0.07                   # Distance threshold for "fallen" cube
+    success_tolerance = 0.2            # Rotation distance tolerance for success (radians)
+    
+    av_factor = 0.1                    # Averaging factor for consecutive successes
+    action_type = "relative"           # Action type: relative or absolute
     act_moving_average = 1./24
 
     # Multi-goal per episode settings
@@ -195,7 +194,7 @@ class LeapHandEnvCfgBi(DirectRLEnvCfg):
     #adr config
     enable_adr = True
     starting_adr_increments = 0 # 0 for no DR up to num_adr_increments for max DR
-    min_rot_adr_coeff = 0.15  # ADR still uses successes as a proxy; stepping logic removed in env
+    min_rot_adr_coeff = 0.15  # ADR success threshold for domain randomization increases
     min_steps_for_dr_change = 240 * 4 # number of steps
     obs_per_timestep = 32
     obs_timesteps = 3 # same as hist_len

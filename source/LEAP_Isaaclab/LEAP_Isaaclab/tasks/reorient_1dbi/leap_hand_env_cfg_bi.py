@@ -1,13 +1,3 @@
-# --------------------------------------------------------
-# LEAP Hand: Low-Cost, Efficient, and Anthropomorphic Hand for Robot Learning
-# https://arxiv.org/abs/2309.06440
-# Copyright (c) 2025 Kenneth Shaw, Sri Anumakonda
-# Licensed under The MIT License [see LICENSE for details]
-# --------------------------------------------------------
-# Based on:
-# https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab_tasks/isaaclab_tasks/direct/inhand_manipulation/inhand_manipulation_env.py
-# --------------------------------------------------------
-
 from LEAP_Isaaclab.assets import LEAP_HAND_CFG
 
 import isaaclab.sim as sim_utils

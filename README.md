@@ -1,5 +1,5 @@
-# LEAP Hand 1-Axis In-Hand Reorientation for Isaac Lab
-This repository is for the final project of the MIT Robotic Manipulation 6.4212 course. It has code for in-hand 1-axis reorientation, either infinitely spinning or to a specified goal position. It will soon have code for full 3D reorientation.
+# LEAP Hand In-Hand Reorientation for Isaac Lab
+This repository is for the final project of the MIT Robotic Manipulation 6.4212 course. It has code for in-hand reorientation tasks including 1-axis rotation and full 3D reorientation.
 
 ## Installation
 Download both Isaac Sim and IsaacLab from the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html). This repository is tested on a conda environment with IsaacSim version 4.5 and Isaaclab version 2.1.0 on Ubuntu 22.04.
@@ -22,41 +22,66 @@ python -m pip install -e source/LEAP_Isaaclab
 ## Project Structure
 ```
 source/LEAP_Isaaclab/LEAP_Isaaclab/tasks/
-├── reorient_1dbi2/          # 1-axis rotation task
-│   ├── __init__.py
-│   ├── env_cfg.py
-│   └── agent_cfg.py
-├── reorient_1dgoal/          # Bi-directional rotation task
-│   ├── __init__.py
-│   ├── env_cfg.py
-│   └── agent_cfg.py
-└── reorient_3d/          # Full 3D reorientation task
+├── reorient_1d/              # 1-axis infinite rotation task
+├── reorient_1dbi2/           # 1-axis goal-conditioned rotation task
+└── reorient_3d/              # Full 3D reorientation task
     ├── __init__.py
-    ├── env_cfg.py
-    └── agent_cfg.py
+    ├── leap_hand_env_cfg_3d.py
+    ├── reorientation_env_3d.py
+    └── agents/
 
 logs/rl_games/
-├── reorient_1dbi2/          # 1D policy checkpoints
-├── reorient_1dgoal/          # BI policy checkpoints
-└── reorient_3d/          # 3D policy checkpoints
+├── reorient_1d/              # 1D policy checkpoints
+├── reorient_1dbi2/           # 1D bi-directional policy checkpoints
+└── reorient_3d/              # 3D policy checkpoints
 ```
 
-## Training a policy
-Once in the `LEAP_Isaaclab` parent directory in your terminal, you can train a policy by entering the following command into the terminal. Note that the policies in this repository are tested with the `rl_games` library.
+## Available Tasks
 
-We have 3 tasks: - Reorient_Cube_1D: Original policy from LEAP: Just spinning the cube infinitly, with a environmental pause at goal rotation that is not handled by the policy (policy is not goal conditioned) - Reorient_Cube_1Dbi2: A policy that is goal-conditioned and trained to achieve a goal position and wait, and then wait for a new goal. Policy does it all on its own and is able to turn the cube in both directions as a result. - Reorient_Cube_3D: A policy for 3D reorientation using similar logic as 1Dbi2
+| Task Name | Description |
+|-----------|-------------|
+| `Reorient_Cube_1D` | Original LEAP policy: infinite spinning with environment-controlled pauses |
+| `Reorient_Cube_1Dbi2` | Goal-conditioned 1D rotation with bi-directional control |
+| `Reorient_Cube_3D` | Full 3D reorientation with uniform SO(3) goal sampling |
 
-You can train the 1D rotation policy using the following command:
+## Training
+
+Train a policy using the `rl_games` library:
+
+### 1D Rotation
 ```bash
 python scripts/rl_games/train.py --task Reorient_Cube_1D --headless
 ```
 
-And visualize infinite spinning with the policy with the following command:
+### 1D Bi-directional (Goal-conditioned)
 ```bash
-python scripts/rl_games/play.py --task Reorient_Cube_1D --num_envs 1
+python scripts/rl_games/train.py --task Reorient_Cube_1Dbi2 --headless
 ```
 
-Or to a goal position using:
+### 3D Reorientation
 ```bash
-python scripts/rl_games/play.py --task Reorient_Cube_1D --num_envs 1 --goal_angle 0
+python scripts/rl_games/train.py --task Reorient_Cube_3D --headless
 ```
+
+## Playing / Visualization
+
+### 1D Tasks
+```bash
+python scripts/rl_games/play.py --task Reorient_Cube_1D --num_envs 1  --goal_angle 0
+python scripts/rl_games/play.py --task Reorient_Cube_1Dbi2 --num_envs 1 --goal_angle 0
+```
+
+### 3D Reorientation
+```bash
+python scripts/rl_games/play.py --task Reorient_Cube_3D --num_envs 1 --goal_angle 0
+```
+
+## Technical Details
+
+### 3D Goal Sampling
+The 3D task uses **uniform quaternion sampling over SO(3)** via 4D Gaussian normalization:
+```python
+q = torch.randn(n, 4, device=device)
+q = q / torch.norm(q, dim=-1, keepdim=True)
+```
+This avoids gimbal lock issues that would arise from Euler angle sampling and provides mathematically uniform coverage of all possible orientations.

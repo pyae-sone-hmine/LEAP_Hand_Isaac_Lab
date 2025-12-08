@@ -1,13 +1,3 @@
-# --------------------------------------------------------
-# LEAP Hand: Low-Cost, Efficient, and Anthropomorphic Hand for Robot Learning
-# https://arxiv.org/abs/2309.06440
-# Copyright (c) 2025 Kenneth Shaw, Sri Anumakonda
-# Licensed under The MIT License [see LICENSE for details]
-# --------------------------------------------------------
-# Based on:
-# https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab_tasks/isaaclab_tasks/direct/inhand_manipulation/inhand_manipulation_env.py
-# --------------------------------------------------------
-
 from LEAP_Isaaclab.assets import LEAP_HAND_CFG
 
 import isaaclab.sim as sim_utils
@@ -96,6 +86,7 @@ class EventCfg:
 
 @configclass
 class LeapHandEnvCfg3D(DirectRLEnvCfg):
+    """Configuration for full 3D in-hand reorientation task."""
     # env
     decimation = 4
     min_episode_length_s = 20.0
@@ -170,20 +161,19 @@ class LeapHandEnvCfg3D(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=8192, env_spacing=0.75, replicate_physics=False)
-    # reward scales
-    z_rotation_steps = 16              # no longer used for stepping, kept for ADR formulas
-    dynamic_goal_mode = False          # ignored in the environment logic now
+    # reward scales (3D reorientation)
+    dynamic_goal_mode = False          # When True, disable random goal sampling / switching and use fixed goal quat from CLI/UI (inference mode)
     dist_reward_scale = -10.0
     rot_reward_scale = 1.0
     rot_eps = 0.1
-    action_penalty_scale = -0.0002
+    action_penalty_scale = -0.0006
     torque_penalty_scale = -0.0
-    pose_diff_penalty_scale = -0.3
+    ftip_penalty_scale = -0.25          # Penalty for fingertips being far from object
     angvel_penalty_scale = -0.5        # Penalty on angular velocity (hold still)
     reach_goal_bonus = 250
     fall_penalty = -10
     fall_dist = 0.07
-    success_tolerance = 0.2
+    success_tolerance = 0.3            # Slightly higher tolerance for full 3D rotation (radians)
     av_factor = 0.1
     action_type="relative" # absolute
     act_moving_average = 1./24
@@ -195,7 +185,7 @@ class LeapHandEnvCfg3D(DirectRLEnvCfg):
     #adr config
     enable_adr = True
     starting_adr_increments = 0 # 0 for no DR up to num_adr_increments for max DR
-    min_rot_adr_coeff = 0.15  # ADR still uses successes as a proxy; stepping logic removed in env
+    min_rot_adr_coeff = 0.15  # ADR uses successes as a proxy for 3D rotation progress
     min_steps_for_dr_change = 240 * 4 # number of steps
     obs_per_timestep = 32
     obs_timesteps = 3 # same as hist_len
