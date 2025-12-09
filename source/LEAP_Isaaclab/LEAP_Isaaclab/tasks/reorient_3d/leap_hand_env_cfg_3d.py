@@ -80,13 +80,14 @@ class EventCfg:
         mode="prestartup",
         params={
             "asset_cfg": SceneEntityCfg("object"),
-            "scale_range": (1.1, 1.25), # adr with object scale is not possible so have to define across all envs
+            "scale_range": (1.0, 1.0),  # Fixed size for sim-only training
         },
     )
 
 @configclass
 class LeapHandEnvCfg3D(DirectRLEnvCfg):
-    """Configuration for full 3D in-hand reorientation task."""
+    """Configuration for full 3D in-hand cube reorientation task."""
+    
     # env
     decimation = 4
     min_episode_length_s = 20.0
@@ -95,9 +96,9 @@ class LeapHandEnvCfg3D(DirectRLEnvCfg):
     hist_len = 3
     store_cur_actions = True
 
-    # 16 joint pos + 16 joint targets + 4 object quat + 4 goal quat = 40 per timestep
-    # 40 * hist_len(3) = 120
-    observation_space = 120
+    # 16 joint pos + 16 joint targets + 3 object pos + 4 object quat + 4 goal quat = 43 per timestep
+    # 43 * hist_len(3) = 129
+    observation_space = 129
     state_space = 0
 
     # simulation
@@ -148,6 +149,7 @@ class LeapHandEnvCfg3D(DirectRLEnvCfg):
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.00, -0.1, 0.56), rot=(1.0, 0.0, 0.0, 0.0)),
     )
+    
     # goal object
     goal_object_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/Visuals/goal_marker",
@@ -161,37 +163,51 @@ class LeapHandEnvCfg3D(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=8192, env_spacing=0.75, replicate_physics=False)
-    # reward scales (3D reorientation)
-    dynamic_goal_mode = False          # When True, disable random goal sampling / switching and use fixed goal quat from CLI/UI (inference mode)
-    dist_reward_scale = -10.0
-    rot_reward_scale = 1.0
-    rot_eps = 0.1
-    action_penalty_scale = -0.0006
-    torque_penalty_scale = -0.0
-    ftip_penalty_scale = -0.25          # Penalty for fingertips being far from object
+    
+    # reward scales
+    dynamic_goal_mode = False          # When True, disable random goal sampling (inference mode)
+    dist_reward_scale = -50.0          # Keep cube in hand penalty
+    rot_reward_scale = 2.0             # Rotation alignment reward
+    rot_eps = 0.1                      # Epsilon for rotation reward denominator
+    action_penalty_scale = -0.0005     # Action regularization
+    torque_penalty_scale = -0.001      # Torque penalty
+    pose_diff_penalty_scale = -0.1     # Joint pose difference penalty
     angvel_penalty_scale = -0.5        # Penalty on angular velocity (hold still)
-    reach_goal_bonus = 250
-    fall_penalty = -10
-    fall_dist = 0.07
-    success_tolerance = 0.3            # Slightly higher tolerance for full 3D rotation (radians)
-    av_factor = 0.1
-    action_type="relative" # absolute
+    fingertip_dist_penalty_scale = 0.0 # Penalty on fingertip distance (disabled)
+    
+    # Checkpoint reward configuration (3D uses rotation distance, not angle)
+    # checkpoint_step_rad defines the rotation distance step for intermediate rewards
+    checkpoint_step_rad = 0.4          # ~23 degrees in rotation distance
+    checkpoint_bonus = 50.0            # Bonus for reaching each intermediate checkpoint
+    reach_goal_bonus = 250.0           # Larger bonus for reaching final goal
+    
+    # Centering
+    centering_reward_scale = 1.0       # Positive reward for being centered
+    centering_sigma = 0.02             # Stddev for centering Gaussian
+    
+    # Success/failure thresholds
+    fall_penalty = -15.0               # Penalty for dropping cube
+    fall_dist = 0.07                   # Distance threshold for "fallen" cube
+    success_tolerance = 0.2            # Rotation distance tolerance for success (radians)
+    
+    av_factor = 0.1                    # Averaging factor for consecutive successes
+    action_type = "relative"           # Action type: relative or absolute
     act_moving_average = 1./24
 
     # Multi-goal per episode settings
     min_hold_steps = 10                # Minimum steps to hold at goal before switching
     max_hold_steps = 30                # Maximum steps to hold at goal before switching
 
-    #adr config
-    enable_adr = True
-    starting_adr_increments = 0 # 0 for no DR up to num_adr_increments for max DR
-    min_rot_adr_coeff = 0.15  # ADR uses successes as a proxy for 3D rotation progress
-    min_steps_for_dr_change = 240 * 4 # number of steps
-    obs_per_timestep = 32
-    obs_timesteps = 3 # same as hist_len
+    # ADR config (disabled by default for sim-only training)
+    enable_adr = False
+    starting_adr_increments = 0
+    min_rot_adr_coeff = 0.15
+    min_steps_for_dr_change = 240 * 4
+    obs_per_timestep = 43
+    obs_timesteps = 3  # same as hist_len
 
-    wrench_trigger_every = 90 # resample every this many policy steps
-    torsional_radius = 0.0 # m
+    wrench_trigger_every = 90
+    torsional_radius = 0.0
     wrench_prob_per_rollout = 0.5
 
     # domain randomization config
@@ -227,12 +243,12 @@ class LeapHandEnvCfg3D(DirectRLEnvCfg):
             "y_width_spawn": (0.0, 0.01),
             "x_rotation": (0.0, 0.1),
             "y_rotation": (0.0, 0.1),
-            "z_rotation": (0.0, 0.0),
+            "z_rotation": (0.0, 0.1),  # Now randomize all axes
         },
-        "object_state_noise": {  # not used as the policy is dependant on action states and not object state
-            "object_pos_noise": (0.0, 0.00), # m
+        "object_state_noise": {
+            "object_pos_noise": (0.0, 0.00),
             "object_pos_bias": (0.0, 0.0),
-            "object_rot_noise": (0.0, 0.0), # rad
+            "object_rot_noise": (0.0, 0.0),
             "object_rot_bias": (0.0, 0.0),
         },
         "robot_spawn": {
@@ -257,4 +273,4 @@ class LeapHandEnvCfg3D(DirectRLEnvCfg):
     act_max_latency = int(adr_custom_cfg_dict["action_latency"]["hand_latency"][1])
     act_latency_rand = 1
     obs_max_latency = int(adr_custom_cfg_dict["obs_latency"]["latency"][1])
-    obs_latency_rand = 1  #this is how much randomization between episodes in latency, 1 or 2 steps is recommend so the latency isn't constantly increasing but in a distribution.
+    obs_latency_rand = 1

@@ -23,42 +23,40 @@ from isaaclab.utils.math import (
     quat_from_euler_xyz,
 )
 import time
+
+# Try to import random_orientation, provide fallback if not available
+try:
+    from isaaclab.utils.math import random_orientation
+except ImportError:
+    def random_orientation(num: int, device: torch.device) -> torch.Tensor:
+        """Generate random unit quaternions using the standard method.
+        
+        Returns quaternions in (w, x, y, z) format.
+        """
+        # Sample from standard normal distribution
+        q = torch.randn(num, 4, device=device)
+        # Normalize to unit quaternions
+        q = q / torch.norm(q, dim=-1, keepdim=True)
+        # Ensure w is positive (canonical form)
+        q = torch.where(q[:, 0:1] < 0, -q, q)
+        return q
+
 if TYPE_CHECKING:
-    from LEAP_Isaaclab.tasks.reorient_3d.leap_hand_env_cfg_3d import LeapHandEnvCfg3D
+    from LEAP_Isaaclab.tasks.leap_hand_reorient.leap_hand_env_cfg_3d import LeapHandEnvCfg3D
 
 from LEAP_Isaaclab.utils import adr_utils, obs_utils
 from LEAP_Isaaclab.utils.adr import LeapHandADR
 
 
-def sample_uniform_quaternion(n: int, device: torch.device) -> torch.Tensor:
-    """Sample uniformly distributed unit quaternions over SO(3).
-    
-    Uses 4D Gaussian normalization which is mathematically proven to give
-    uniform distribution over SO(3) because the 4D Gaussian is spherically symmetric.
-    
-    Args:
-        n: Number of quaternions to sample
-        device: Torch device to create tensor on
-        
-    Returns:
-        Tensor of shape (n, 4) with quaternions in (w, x, y, z) format
-    """
-    q = torch.randn(n, 4, device=device)
-    q = q / torch.norm(q, dim=-1, keepdim=True)
-    return q
-
-
 class ReorientationEnv3D(DirectRLEnv):
-    """Full 3D in-hand reorientation environment with uniform SO(3) goal sampling."""
+    """Full 3D in-hand cube reorientation environment."""
+    
     cfg: LeapHandEnvCfg3D
 
     def __init__(self, cfg: LeapHandEnvCfg3D, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
         self.num_hand_dofs = self.hand.num_joints
-
-        # For 3D control: track a fixed goal quaternion for inference mode
-        self.current_goal_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)  # Identity quaternion
 
         # buffers for position targets
         self.hand_dof_targets = torch.zeros((self.num_envs, self.num_hand_dofs), dtype=torch.float, device=self.device)
@@ -89,6 +87,12 @@ class ReorientationEnv3D(DirectRLEnv):
         self.hold_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self.goals_completed_this_episode = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
 
+        # Checkpoint reward tracking for 3D
+        # Instead of tracking Z-angle progress, we track rotation distance reduction
+        self.initial_rot_dist = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.num_checkpoints = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.checkpoints_reached = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+
         # used to compare object position (keep cube in hand)
         self.in_hand_pos = self.object.data.default_root_state[:, 0:3].clone()
         self.in_hand_pos[:, 2] += 0.01
@@ -102,7 +106,7 @@ class ReorientationEnv3D(DirectRLEnv):
         # initialize goal marker
         self.goal_markers = VisualizationMarkers(self.cfg.goal_object_cfg)
 
-        # track successes for logging / ADR (no longer used to advance goals)
+        # track successes for logging / ADR
         self.successes = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.consecutive_successes = torch.zeros(1, dtype=torch.float, device=self.device)
 
@@ -123,7 +127,6 @@ class ReorientationEnv3D(DirectRLEnv):
         self.object_rot[:, 0] = 1.0
 
         # initialize history tensor
-        # per-timestep obs size = observation_space // hist_len
         self.obs_hist_buf = torch.zeros(
             (self.num_envs, self.cfg.observation_space // self.cfg.hist_len, self.cfg.hist_len),
             device=self.device,
@@ -220,9 +223,6 @@ class ReorientationEnv3D(DirectRLEnv):
         # Clone to avoid modifying original actions
         actions = self.actions.clone()
 
-        # No environment-side freezing or stepping on goal reach.
-        # The policy is always in control and must learn to stop at the goal.
-
         if self.cfg.action_type == "relative":
             targets = self.prev_targets[:, self.actuated_dof_indices] + self.cfg.act_moving_average * actions
             self.cur_targets[:, self.actuated_dof_indices] = saturate(
@@ -260,9 +260,10 @@ class ReorientationEnv3D(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         """
-        Observation now includes:
+        Observation per timestep includes:
         - normalized hand DOF positions
         - current joint targets
+        - object world position (env-origin offset)
         - object orientation (quat)
         - goal orientation (quat)
         """
@@ -277,6 +278,9 @@ class ReorientationEnv3D(DirectRLEnv):
 
         if self.cfg.store_cur_actions:
             per_timestep_features.append(self.cur_targets[:])
+
+        # object world position (relative to env origin)
+        per_timestep_features.append(self.object_pos)
 
         # condition on current object orientation (w, x, y, z)
         per_timestep_features.append(self.object_rot)
@@ -294,7 +298,10 @@ class ReorientationEnv3D(DirectRLEnv):
         return {"policy": obs.float()}
 
     def _get_rewards(self) -> torch.Tensor:
-
+        """Compute rewards for 3D reorientation with checkpoint bonuses."""
+        
+        # Compute penalties
+        pose_diff_penalty = ((self.cur_targets[:, self.actuated_dof_indices] - self.override_default_joint_pos) ** 2).sum(-1)
         torque_penalty = (self.hand.data.computed_torque ** 2).sum(-1)
 
         (
@@ -303,6 +310,7 @@ class ReorientationEnv3D(DirectRLEnv):
             self.successes[:],
             self.consecutive_successes[:],
             new_success,
+            rot_dist,
         ) = compute_rewards(
             self.reset_buf,
             self.reset_goal_buf,
@@ -317,37 +325,72 @@ class ReorientationEnv3D(DirectRLEnv):
             self.goal_rot,
             self.object_linvel,
             self.object_angvel,
+            self.actions,
+            pose_diff_penalty,
+            torque_penalty,
+            # Reward scales
             self.cfg.dist_reward_scale,
             self.cfg.rot_reward_scale,
             self.cfg.rot_eps,
-            self.actions,
             self.cfg.action_penalty_scale,
-            torque_penalty,
+            self.cfg.pose_diff_penalty_scale,
             self.cfg.torque_penalty_scale,
-            self.cfg.ftip_penalty_scale,
-            self.cfg.success_tolerance,
-            self.cfg.reach_goal_bonus,
+            self.cfg.angvel_penalty_scale,
+            # Success/failure params
             self.cfg.fall_dist,
             self.cfg.fall_penalty,
+            self.cfg.success_tolerance,
             self.cfg.av_factor,
-            self.cfg.angvel_penalty_scale,
+            self.cfg.fingertip_dist_penalty_scale,
+            self.cfg.centering_sigma,
+            self.cfg.centering_reward_scale,
         )
+
+        # === 3D CHECKPOINT BONUS LOGIC ===
+        # Progress is measured by how much we've reduced the rotation distance
+        # from initial_rot_dist toward 0 (the goal)
+        progress = self.initial_rot_dist - rot_dist
+        progress = torch.clamp(progress, min=0)  # Only count forward progress
+        
+        # Number of checkpoints reached = floor(progress / checkpoint_step)
+        checkpoints_now = torch.floor(progress / self.cfg.checkpoint_step_rad).to(torch.int32)
+        checkpoints_now = torch.clamp(checkpoints_now, min=0)
+        checkpoints_now = torch.minimum(checkpoints_now, self.num_checkpoints - 1)
+        
+        # Calculate newly crossed checkpoints
+        new_checkpoints = checkpoints_now - self.checkpoints_reached
+        new_checkpoints = torch.clamp(new_checkpoints, min=0)
+        
+        # Apply checkpoint bonuses
+        checkpoint_reward = new_checkpoints.float() * self.cfg.checkpoint_bonus
+        total_reward = total_reward + checkpoint_reward
+        
+        # Update checkpoints reached
+        self.checkpoints_reached = torch.maximum(self.checkpoints_reached, checkpoints_now)
+        
+        # === FINAL GOAL BONUS ===
+        total_reward = torch.where(new_success, total_reward + self.cfg.reach_goal_bonus, total_reward)
 
         # Update has_succeeded flag when new success occurs
         self.has_succeeded = torch.logical_or(self.has_succeeded, new_success)
 
-        # Goal switching logic: handle hold phases and new goals
+        # Goal switching logic
         self._update_goals(new_success)
 
-        # logging (successes are no longer used to advance goals, only for diagnostics)
+        # Logging
         self.extras["log"]["consecutive_successes"] = self.consecutive_successes.mean()
         self.extras["log"]["goals_per_episode"] = self.goals_completed_this_episode.float().mean()
         self.extras["log"]["avg_hold_remaining"] = self.hold_counter.float().mean()
+        self.extras["log"]["rot_dist"] = rot_dist.mean()
+        self.extras["log"]["pose_diff_penalty"] = pose_diff_penalty.mean()
         self.extras["log"]["torque_info"] = torque_penalty.mean()
         self.extras["log"]['object_linvel'] = torch.norm(self.object_linvel, p=1, dim=-1).mean()
         self.extras["log"]['roll'] = self.object_angvel[:, 0].mean()
         self.extras["log"]['pitch'] = self.object_angvel[:, 1].mean()
         self.extras["log"]['yaw'] = self.object_angvel[:, 2].mean()
+        self.extras["log"]["checkpoints_reached"] = self.checkpoints_reached.float().mean()
+        self.extras["log"]["checkpoint_reward"] = checkpoint_reward.mean()
+        self.extras["log"]["initial_rot_dist"] = self.initial_rot_dist.mean()
 
         # Log episode length statistics
         self.extras["log"]["avg_episode_length_s"] = (
@@ -361,27 +404,23 @@ class ReorientationEnv3D(DirectRLEnv):
         ).max()
 
         if self.cfg.enable_adr:
-            # Use successes as ADR signal for 3D rotation progress
             adr_criteria = (
-                self.consecutive_successes
+                self.consecutive_successes.float().mean()
                 / (self.randomized_episode_lengths.float().mean() * self.cfg.sim.dt * self.cfg.decimation)
             ).float().mean()
             self.extras["log"]["adr_criteria"] = adr_criteria
-
-        # Note: goal is not advanced here; environment does not modify the goal on success.
-        # Policy must learn to reach and stabilise near the goal without external stepping.
 
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._compute_intermediate_values()
-        # reset when cube has fallen (position-based only for 3D - any orientation is valid)
+        # reset when cube has fallen
         goal_dist = torch.norm(self.object_pos - self.in_hand_pos, p=2, dim=-1)
         out_of_reach = goal_dist >= self.cfg.fall_dist
         time_out = self.episode_length_buf >= self.randomized_episode_lengths - 1
 
-        # NOTE: For full 3D reorientation, we do NOT terminate on "flipped" cube
-        # since any orientation is a valid goal state
+        # For 3D reorientation, we don't terminate on "flipped" cube
+        # since any orientation is a valid goal
 
         return out_of_reach, time_out
 
@@ -507,15 +546,29 @@ class ReorientationEnv3D(DirectRLEnv):
                 False,
             )
 
-        # initialize goal rotation (full 3D uniform sampling over SO(3))
+        # initialize goal rotation - sample random 3D orientations
         self._compute_intermediate_values()
 
         if self.cfg.dynamic_goal_mode:
-            # In inference mode: use a fixed goal quaternion (set from CLI/UI)
-            self.goal_rot[env_ids] = self.current_goal_quat.unsqueeze(0).expand(len(env_ids), -1)
+            # Inference mode: keep current goal (can be set externally)
+            pass
         else:
-            # Training mode: sample uniformly distributed quaternions over SO(3)
-            self.goal_rot[env_ids] = sample_uniform_quaternion(len(env_ids), self.device)
+            # Training mode: sample random 3D orientations
+            self.goal_rot[env_ids] = random_orientation(len(env_ids), self.device)
+
+        # Initialize checkpoint tracking for 3D
+        # Compute initial rotation distance from current object orientation to goal
+        current_rot_dist = rotation_distance(self.object_rot[env_ids], self.goal_rot[env_ids])
+        self.initial_rot_dist[env_ids] = current_rot_dist
+        
+        # Compute number of checkpoints based on total rotation distance
+        self.num_checkpoints[env_ids] = torch.ceil(
+            current_rot_dist / self.cfg.checkpoint_step_rad
+        ).to(torch.int32)
+        self.num_checkpoints[env_ids] = torch.clamp(self.num_checkpoints[env_ids], min=1)
+        
+        # Reset checkpoints reached
+        self.checkpoints_reached[env_ids] = 0
 
         # update goal markers
         goal_pos = self.goal_pos + self.scene.env_origins
@@ -523,16 +576,11 @@ class ReorientationEnv3D(DirectRLEnv):
 
     def _update_goals(self, new_success: torch.Tensor):
         """
-        Handle goal switching logic for 3D reorientation:
-        - When new success occurs, start hold phase
-        - After hold phase, sample new 3D goal orientation and continue episode
+        Handle goal switching logic for 3D reorientation.
         """
-        if self.cfg.dynamic_goal_mode:
-            return
         # Start hold phase for newly successful envs
         newly_successful = new_success.bool()
         if newly_successful.any():
-            # Sample hold lengths for newly successful envs
             hold_lengths = torch.randint(
                 self.cfg.min_hold_steps,
                 self.cfg.max_hold_steps + 1,
@@ -550,19 +598,30 @@ class ReorientationEnv3D(DirectRLEnv):
         # Decrement hold counters
         self.hold_counter = torch.clamp(self.hold_counter - 1, min=0)
 
-        # Sample new goals for envs that finished holding and have succeeded
+        # Check for envs that finished holding and have succeeded
         finished_holding = (self.hold_counter == 0) & self.has_succeeded
         if finished_holding.any():
-            # Sample new 3D goal orientations (uniform over SO(3))
             env_indices = torch.where(finished_holding)[0]
-            self.goal_rot[env_indices] = sample_uniform_quaternion(len(env_indices), self.device)
 
-            # Reset success flags for these envs to allow new bonus
+            if not self.cfg.dynamic_goal_mode:
+                # Training mode: sample new random 3D orientations
+                self.goal_rot[env_indices] = random_orientation(len(env_indices), self.device)
+
+                # Reset checkpoint tracking for new goals
+                current_rot_dist = rotation_distance(self.object_rot[env_indices], self.goal_rot[env_indices])
+                self.initial_rot_dist[env_indices] = current_rot_dist
+                self.num_checkpoints[env_indices] = torch.ceil(
+                    current_rot_dist / self.cfg.checkpoint_step_rad
+                ).to(torch.int32)
+                self.num_checkpoints[env_indices] = torch.clamp(self.num_checkpoints[env_indices], min=1)
+                self.checkpoints_reached[env_indices] = 0
+
+                # Update goal markers
+                goal_pos = self.goal_pos + self.scene.env_origins
+                self.goal_markers.visualize(goal_pos, self.goal_rot)
+
+            # Reset success flags
             self.has_succeeded[env_indices] = False
-
-            # Update goal markers
-            goal_pos = self.goal_pos + self.scene.env_origins
-            self.goal_markers.visualize(goal_pos, self.goal_rot)
 
     def _compute_intermediate_values(self):
         # data for hand
@@ -592,62 +651,25 @@ class ReorientationEnv3D(DirectRLEnv):
         print(f"sim2real_indices: {sim2real_idx_16}")
         print(f"real2sim_indices: {real2sim_idx_16}")
 
-    def set_goal_quat(self, quat: torch.Tensor | list | tuple):
-        """Set the goal quaternion dynamically. Called from UI / CLI.
-        
-        Args:
-            quat: Quaternion in (w, x, y, z) format. Can be a tensor, list, or tuple.
-        """
-        if not isinstance(quat, torch.Tensor):
-            quat = torch.tensor(quat, dtype=torch.float, device=self.device)
-        
-        # Normalize to ensure unit quaternion
-        quat = quat / torch.norm(quat)
-
-        # Remember the requested quaternion
-        self.current_goal_quat = quat
-
-        # Treat this as "fixed-goal" / inference mode
+    def set_goal_quat(self, quat: torch.Tensor):
+        """Set goal orientation directly (for inference/UI). quat shape: (4,) as [w,x,y,z]"""
         self.cfg.dynamic_goal_mode = True
-
-        # Reset success / hold state so this new goal acts like a fresh target
+        self.goal_rot[:] = quat.to(self.device)
+        
+        # Reset tracking
         self.has_succeeded[:] = False
         self.hold_counter[:] = 0
-
-        # Update goal rotation for all environments
-        self.goal_rot = quat.unsqueeze(0).expand(self.num_envs, -1).clone()
-
-        # Update goal markers
+        
+        # Update checkpoints
+        current_rot_dist = rotation_distance(self.object_rot, self.goal_rot)
+        self.initial_rot_dist[:] = current_rot_dist
+        self.num_checkpoints[:] = torch.ceil(current_rot_dist / self.cfg.checkpoint_step_rad).to(torch.int32)
+        self.num_checkpoints[:] = torch.clamp(self.num_checkpoints, min=1)
+        self.checkpoints_reached[:] = 0
+        
+        # Update markers
         goal_pos = self.goal_pos + self.scene.env_origins
         self.goal_markers.visualize(goal_pos, self.goal_rot)
-
-        print(f"[ReorientationEnv3D] Goal quaternion set to (w={quat[0]:.3f}, x={quat[1]:.3f}, y={quat[2]:.3f}, z={quat[3]:.3f})")
-
-    def set_goal_euler_deg(self, roll: float, pitch: float, yaw: float):
-        """Set the goal orientation from Euler angles (in degrees). Convenience wrapper.
-        
-        Args:
-            roll: Rotation around X axis in degrees
-            pitch: Rotation around Y axis in degrees  
-            yaw: Rotation around Z axis in degrees
-        """
-        roll_rad = math.radians(roll)
-        pitch_rad = math.radians(pitch)
-        yaw_rad = math.radians(yaw)
-        
-        # Convert to quaternion
-        quat = quat_from_euler_xyz(
-            torch.tensor([roll_rad], device=self.device),
-            torch.tensor([pitch_rad], device=self.device),
-            torch.tensor([yaw_rad], device=self.device),
-        ).squeeze(0)
-        
-        self.set_goal_quat(quat)
-        print(f"[ReorientationEnv3D] Set from Euler: roll={roll:.1f}°, pitch={pitch:.1f}°, yaw={yaw:.1f}°")
-
-    def get_goal_quat(self) -> torch.Tensor:
-        """Get the current goal quaternion (for global overrides)."""
-        return self.current_goal_quat.clone()
 
 
 @torch.jit.script
@@ -661,10 +683,10 @@ def unscale(x, lower, upper):
 
 
 @torch.jit.script
-def rotation_distance(object_rot, target_rot):
-    # Orientation alignment for the cube in hand and goal cube
+def rotation_distance(object_rot: torch.Tensor, target_rot: torch.Tensor) -> torch.Tensor:
+    """Compute geodesic distance between two quaternions."""
     quat_diff = quat_mul(object_rot, quat_conjugate(target_rot))
-    return 2.0 * torch.asin(torch.clamp(torch.norm(quat_diff[:, 1:4], p=2, dim=-1), max=1.0))  # changed quat convention
+    return 2.0 * torch.asin(torch.clamp(torch.norm(quat_diff[:, 1:4], p=2, dim=-1), max=1.0))
 
 
 @torch.jit.script
@@ -682,83 +704,96 @@ def compute_rewards(
     target_rot: torch.Tensor,
     object_linvel: torch.Tensor,
     object_angvel: torch.Tensor,
+    actions: torch.Tensor,
+    pose_diff_penalty: torch.Tensor,
+    torque_penalty: torch.Tensor,
+    # Reward scales
     dist_reward_scale: float,
     rot_reward_scale: float,
     rot_eps: float,
-    actions: torch.Tensor,
     action_penalty_scale: float,
-    torque_penalty: torch.Tensor,
+    pose_diff_penalty_scale: float,
     torque_penalty_scale: float,
-    ftip_penalty_scale: float,
-    success_tolerance: float,
-    reach_goal_bonus: float,
+    angvel_penalty_scale: float,
+    # Success/failure params
     fall_dist: float,
     fall_penalty: float,
+    success_tolerance: float,
     av_factor: float,
-    angvel_penalty_scale: float,
+    fingertip_dist_penalty_scale: float,
+    centering_sigma: float,
+    centering_reward_scale: float,
 ):
-
-    # keep cube in-hand near target_pos (in_hand_pos)
+    """
+    Compute rewards for 3D reorientation.
+    """
+    # Distance from object to target position (for fall detection and cube-in-hand)
     goal_dist = torch.norm(object_pos - target_pos, p=2, dim=-1)
 
-    # orientation distance to goal orientation
+    # Rotation distance to goal (geodesic on SO(3))
     rot_dist = rotation_distance(object_rot, target_rot)
 
-    # distance and rotation rewards
+    # === REWARD TERMS ===
+    
+    # 1. Distance reward: keep cube in hand
     dist_rew = goal_dist * dist_reward_scale
-    rot_rew = 1.0 / (torch.abs(rot_dist) + rot_eps) * rot_reward_scale
+    centering_rew = torch.exp(-goal_dist / centering_sigma) * centering_reward_scale
 
-    # regularization penalties
-    action_penalty = torch.sum(actions**2, dim=-1)
+    # 2. Rotation reward: incentivize alignment with goal
+    rot_rew_raw = 1.0 / (torch.abs(rot_dist) + rot_eps) * rot_reward_scale
+    # Cap reward once within success tolerance
+    at_goal = rot_dist < success_tolerance
+    rot_rew = torch.where(at_goal, torch.ones_like(rot_rew_raw) * (1.0 / (success_tolerance + rot_eps)) * rot_reward_scale, rot_rew_raw)
+    
+    # 3. Action penalty
+    action_penalty = torch.sum(actions ** 2, dim=-1)
 
-    # fingertip distance penalty - keep ALL fingertips close to object
-    # Use max instead of mean so policy can't sacrifice some fingers while keeping others close
-    fingertip_dist = torch.norm(fingertip_pos - object_pos.unsqueeze(1), p=2, dim=-1)
-    fingertip_dist_max = torch.max(fingertip_dist, dim=-1)[0]
-    ftip_penalty = fingertip_dist_max * ftip_penalty_scale
+    # 4. Pose difference penalty
+    pose_rew = pose_diff_penalty * pose_diff_penalty_scale
 
-    # Hold penalty: penalize angular velocity to encourage stopping at goal
+    # 5. Torque penalty
+    torque_rew = torque_penalty * torque_penalty_scale
+
+    # 6. Angular velocity penalty: only when near goal
     ang_speed = torch.norm(object_angvel, p=2, dim=-1)
-    angvel_penalty = ang_speed * angvel_penalty_scale
+    near_goal = rot_dist < 0.3
+    angvel_rew = torch.where(near_goal, ang_speed * angvel_penalty_scale, torch.zeros_like(ang_speed))
 
-    # Total reward:
-    #   - keep cube near palm (dist_rew)
-    #   - align orientation with goal (rot_rew)
-    #   - keep fingertips near object (ftip_penalty)
-    #   - regularize actions and torques
-    #   - penalize angular velocity (hold still)
+    # Fingertip distance penalty
+    fingertip_dist_penalty = torch.norm(fingertip_pos - object_pos.unsqueeze(1), p=2, dim=-1)
+    fingertip_dist_penalty = torch.mean(fingertip_dist_penalty, dim=-1)
+
+    # Total base reward
     reward = (
         dist_rew
         + rot_rew
         + action_penalty * action_penalty_scale
-        + ftip_penalty
-        + torque_penalty * torque_penalty_scale
-        + angvel_penalty
+        + pose_rew
+        + torque_rew
+        + angvel_rew
+        + centering_rew
+        + fingertip_dist_penalty * fingertip_dist_penalty_scale
     )
 
-    # Success detection: orientation and position close to goal, AND not spinning
-    angvel_threshold = 2.0  # rad/s
+    # === SUCCESS DETECTION ===
+    angvel_threshold = 2.0
     success_condition = (
         (torch.abs(rot_dist) <= success_tolerance)
         & (goal_dist <= 0.025)
         & (ang_speed <= angvel_threshold)
     )
 
-    # NEW success: only true if we just reached goal and haven't succeeded before
     new_success = success_condition & (~has_succeeded)
     goal_resets = torch.where(new_success, torch.ones_like(reset_goal_buf), reset_buf)
 
     successes = successes + goal_resets
 
-    # One-time success bonus: only for NEW successes
-    reward = torch.where(new_success, reward + reach_goal_bonus, reward)
+    # Fall penalty and termination
+    fall_envs = goal_dist >= fall_dist
+    reward = torch.where(fall_envs, reward + fall_penalty, reward)
+    resets = torch.where(fall_envs, torch.ones_like(reset_buf), reset_buf)
 
-    # Fall penalty: distance to the in-hand region is larger than a threshold
-    reward = torch.where(goal_dist >= fall_dist, reward + fall_penalty, reward)
-
-    # Check env termination conditions, including maximum success number
-    resets = torch.where(goal_dist >= fall_dist, torch.ones_like(reset_buf), reset_buf)
-
+    # Track consecutive successes
     num_resets = torch.sum(resets)
     finished_cons_successes = torch.sum(successes * resets.float())
 
@@ -768,4 +803,4 @@ def compute_rewards(
         consecutive_successes,
     )
 
-    return reward, goal_resets, successes, cons_successes, new_success
+    return reward, goal_resets, successes, cons_successes, new_success, rot_dist
