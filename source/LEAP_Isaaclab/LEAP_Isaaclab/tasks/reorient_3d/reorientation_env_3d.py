@@ -92,6 +92,7 @@ class ReorientationEnv3D(DirectRLEnv):
         self.initial_rot_dist = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.num_checkpoints = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self.checkpoints_reached = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.prev_rot_dist = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
         # used to compare object position (keep cube in hand)
         self.in_hand_pos = self.object.data.default_root_state[:, 0:3].clone()
@@ -313,6 +314,10 @@ class ReorientationEnv3D(DirectRLEnv):
             self.consecutive_successes[:],
             new_success,
             rot_dist,
+            rot_progress,
+            rot_regress_penalty,
+            align_reward,
+            off_axis_penalty,
         ) = compute_rewards(
             self.reset_buf,
             self.reset_goal_buf,
@@ -330,14 +335,23 @@ class ReorientationEnv3D(DirectRLEnv):
             self.actions,
             pose_diff_penalty,
             torque_penalty,
+            self.prev_rot_dist,
             # Reward scales
             self.cfg.dist_reward_scale,
             self.cfg.rot_reward_scale,
+            self.cfg.rot_exp_decay_scale,
+            self.cfg.rot_linear_penalty_scale,
+            self.cfg.rot_progress_scale,
+            self.cfg.rot_regress_penalty_scale,
             self.cfg.rot_eps,
             self.cfg.action_penalty_scale,
             self.cfg.pose_diff_penalty_scale,
             self.cfg.torque_penalty_scale,
             self.cfg.angvel_penalty_scale,
+            self.cfg.align_angvel_scale,
+            self.cfg.off_axis_penalty_scale,
+            self.cfg.align_gate_dist,
+            self.cfg.align_angvel_cap,
             # Success/failure params
             self.cfg.fall_dist,
             self.cfg.fall_penalty,
@@ -364,7 +378,13 @@ class ReorientationEnv3D(DirectRLEnv):
         new_checkpoints = torch.clamp(new_checkpoints, min=0)
         
         # Apply checkpoint bonuses
-        checkpoint_reward = new_checkpoints.float() * self.cfg.checkpoint_bonus
+        progress_fraction = torch.where(
+            self.initial_rot_dist > 1e-6,
+            progress / torch.clamp(self.initial_rot_dist, min=1e-6),
+            torch.zeros_like(progress),
+        )
+        progress_fraction = torch.clamp(progress_fraction, 0.0, 1.0)
+        checkpoint_reward = new_checkpoints.float() * self.cfg.checkpoint_bonus * progress_fraction
         total_reward = total_reward + checkpoint_reward
         
         # Update checkpoints reached
@@ -384,6 +404,10 @@ class ReorientationEnv3D(DirectRLEnv):
         self.extras["log"]["goals_per_episode"] = self.goals_completed_this_episode.float().mean()
         self.extras["log"]["avg_hold_remaining"] = self.hold_counter.float().mean()
         self.extras["log"]["rot_dist"] = rot_dist.mean()
+        self.extras["log"]["rot_progress"] = rot_progress.mean()
+        self.extras["log"]["rot_regress_penalty"] = rot_regress_penalty.mean()
+        self.extras["log"]["align_angvel_reward"] = align_reward.mean()
+        self.extras["log"]["off_axis_penalty"] = off_axis_penalty.mean()
         self.extras["log"]["pose_diff_penalty"] = pose_diff_penalty.mean()
         self.extras["log"]["torque_info"] = torque_penalty.mean()
         self.extras["log"]['object_linvel'] = torch.norm(self.object_linvel, p=1, dim=-1).mean()
@@ -393,6 +417,7 @@ class ReorientationEnv3D(DirectRLEnv):
         self.extras["log"]["checkpoints_reached"] = self.checkpoints_reached.float().mean()
         self.extras["log"]["checkpoint_reward"] = checkpoint_reward.mean()
         self.extras["log"]["initial_rot_dist"] = self.initial_rot_dist.mean()
+        self.prev_rot_dist = rot_dist.detach()
 
         # Log episode length statistics
         self.extras["log"]["avg_episode_length_s"] = (
@@ -565,6 +590,7 @@ class ReorientationEnv3D(DirectRLEnv):
         # Compute initial rotation distance from current object orientation to goal
         current_rot_dist = rotation_distance(self.object_rot[env_ids], self.goal_rot[env_ids])
         self.initial_rot_dist[env_ids] = current_rot_dist
+        self.prev_rot_dist[env_ids] = current_rot_dist
         
         # Compute number of checkpoints based on total rotation distance
         self.num_checkpoints[env_ids] = torch.ceil(
@@ -615,6 +641,7 @@ class ReorientationEnv3D(DirectRLEnv):
                 # Reset checkpoint tracking for new goals
                 current_rot_dist = rotation_distance(self.object_rot[env_indices], self.goal_rot[env_indices])
                 self.initial_rot_dist[env_indices] = current_rot_dist
+                self.prev_rot_dist[env_indices] = current_rot_dist
                 self.num_checkpoints[env_indices] = torch.ceil(
                     current_rot_dist / self.cfg.checkpoint_step_rad
                 ).to(torch.int32)
@@ -683,6 +710,7 @@ class ReorientationEnv3D(DirectRLEnv):
         # Update checkpoints
         current_rot_dist = rotation_distance(self.object_rot, self.goal_rot)
         self.initial_rot_dist[:] = current_rot_dist
+        self.prev_rot_dist[:] = current_rot_dist
         self.num_checkpoints[:] = torch.ceil(current_rot_dist / self.cfg.checkpoint_step_rad).to(torch.int32)
         self.num_checkpoints[:] = torch.clamp(self.num_checkpoints, min=1)
         self.checkpoints_reached[:] = 0
@@ -710,6 +738,19 @@ def rotation_distance(object_rot: torch.Tensor, target_rot: torch.Tensor) -> tor
 
 
 @torch.jit.script
+def quat_log(quat: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Log map of unit quaternion to so(3) vector (axis * angle).
+    """
+    v = quat[:, 1:4]
+    w = torch.clamp(quat[:, 0], -1.0 + eps, 1.0 - eps)
+    v_norm = torch.norm(v, p=2, dim=-1, keepdim=True)
+    angle = 2.0 * torch.atan2(v_norm, w.unsqueeze(-1))
+    safe_axis = torch.where(v_norm > eps, v / torch.clamp(v_norm, min=eps), torch.zeros_like(v))
+    return safe_axis * angle
+
+
+@torch.jit.script
 def compute_rewards(
     reset_buf: torch.Tensor,
     reset_goal_buf: torch.Tensor,
@@ -727,14 +768,23 @@ def compute_rewards(
     actions: torch.Tensor,
     pose_diff_penalty: torch.Tensor,
     torque_penalty: torch.Tensor,
+    prev_rot_dist: torch.Tensor,
     # Reward scales
     dist_reward_scale: float,
     rot_reward_scale: float,
+    rot_exp_decay_scale: float,
+    rot_linear_penalty_scale: float,
+    rot_progress_scale: float,
+    rot_regress_penalty_scale: float,
     rot_eps: float,
     action_penalty_scale: float,
     pose_diff_penalty_scale: float,
     torque_penalty_scale: float,
     angvel_penalty_scale: float,
+    align_angvel_scale: float,
+    off_axis_penalty_scale: float,
+    align_gate_dist: float,
+    align_angvel_cap: float,
     # Success/failure params
     fall_dist: float,
     fall_penalty: float,
@@ -759,11 +809,43 @@ def compute_rewards(
     dist_rew = goal_dist * dist_reward_scale
     centering_rew = torch.exp(-goal_dist / centering_sigma) * centering_reward_scale
 
-    # 2. Rotation reward: incentivize alignment with goal
-    rot_rew_raw = 1.0 / (torch.abs(rot_dist) + rot_eps) * rot_reward_scale
-    # Cap reward once within success tolerance
+    # 2. Rotation reward: incentivize alignment with goal (geodesic-aware)
     at_goal = rot_dist < success_tolerance
-    rot_rew = torch.where(at_goal, torch.ones_like(rot_rew_raw) * (1.0 / (success_tolerance + rot_eps)) * rot_reward_scale, rot_rew_raw)
+    rot_dist_stable = rot_dist + rot_eps
+    rot_decay = torch.exp(-rot_dist_stable * rot_exp_decay_scale) * rot_reward_scale
+    rot_linear_penalty = -rot_dist_stable * rot_linear_penalty_scale
+    rot_rew = torch.where(at_goal, torch.ones_like(rot_dist) * rot_reward_scale, rot_decay + rot_linear_penalty)
+
+    # 2b. Per-step geodesic progress / regress
+    rot_progress = prev_rot_dist - rot_dist
+    progress_bonus = torch.clamp(rot_progress, min=0.0) * rot_progress_scale
+    regress_penalty = torch.clamp(-rot_progress, min=0.0) * rot_regress_penalty_scale
+
+    # 2c. Align angular velocity with shortest-arc axis, penalize off-axis spinning
+    rel_quat = quat_mul(target_rot, quat_conjugate(object_rot))
+    rel_quat = torch.where(rel_quat[:, 0:1] < 0, -rel_quat, rel_quat)
+    log_err = quat_log(rel_quat, 1e-6)
+    log_norm = torch.norm(log_err, p=2, dim=-1, keepdim=True)
+    has_axis = log_norm > 1e-6
+    err_axis = torch.where(has_axis, log_err / torch.clamp(log_norm, min=1e-6), torch.zeros_like(log_err))
+
+    angvel_dot_raw = torch.where(
+        has_axis.squeeze(-1),
+        torch.sum(object_angvel * err_axis, dim=-1),
+        torch.zeros_like(rot_dist),
+    )
+    angvel_dot_clamped = torch.clamp(angvel_dot_raw, -align_angvel_cap, align_angvel_cap)
+    gated_align = torch.where(rot_dist < align_gate_dist, angvel_dot_clamped, torch.zeros_like(angvel_dot_clamped))
+    align_angvel_rew = gated_align * align_angvel_scale
+
+    off_axis_vec = object_angvel - (angvel_dot_raw.unsqueeze(-1) * err_axis)
+    off_axis_mag = torch.where(
+        has_axis.squeeze(-1),
+        torch.norm(off_axis_vec, p=2, dim=-1),
+        torch.zeros_like(rot_dist),
+    )
+    gated_off_axis = torch.where(rot_dist < align_gate_dist, off_axis_mag, torch.zeros_like(off_axis_mag))
+    off_axis_penalty = gated_off_axis * off_axis_penalty_scale
     
     # 3. Action penalty
     action_penalty = torch.sum(actions ** 2, dim=-1)
@@ -787,6 +869,10 @@ def compute_rewards(
     reward = (
         dist_rew
         + rot_rew
+        + progress_bonus
+        - regress_penalty
+        + align_angvel_rew
+        + off_axis_penalty
         + action_penalty * action_penalty_scale
         + pose_rew
         + torque_rew
@@ -823,4 +909,15 @@ def compute_rewards(
         consecutive_successes,
     )
 
-    return reward, goal_resets, successes, cons_successes, new_success, rot_dist
+    return (
+        reward,
+        goal_resets,
+        successes,
+        cons_successes,
+        new_success,
+        rot_dist,
+        rot_progress,
+        regress_penalty,
+        align_angvel_rew,
+        off_axis_penalty,
+    )

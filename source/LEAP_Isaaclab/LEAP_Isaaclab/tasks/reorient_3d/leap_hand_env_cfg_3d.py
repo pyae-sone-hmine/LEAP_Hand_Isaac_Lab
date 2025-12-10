@@ -169,13 +169,21 @@ class LeapHandEnvCfg3D(DirectRLEnvCfg):
     
     # reward scales
     dynamic_goal_mode = False          # When True, disable random goal sampling (inference mode)
-    dist_reward_scale = -50.0          # Keep cube in hand penalty
-    rot_reward_scale = 2.0             # Rotation alignment reward
-    rot_eps = 0.1                      # Epsilon for rotation reward denominator
+    dist_reward_scale = -30.0          # Keep cube in hand penalty (reduced to avoid collapse)
+    rot_reward_scale = 4.0             # Rotation alignment reward (stronger pull to goal)
+    rot_exp_decay_scale = 3.5          # Exponential falloff weight for rotation distance
+    rot_linear_penalty_scale = 1.8     # Linear penalty on rotation distance
+    rot_progress_scale = 15.0          # Bonus for per-step geodesic progress
+    rot_regress_penalty_scale = 10.0   # Penalty for moving away from goal
+    rot_eps = 0.02                     # Epsilon for rotation shaping stability
     action_penalty_scale = -0.0005     # Action regularization
     torque_penalty_scale = -0.001      # Torque penalty
     pose_diff_penalty_scale = -0.1     # Joint pose difference penalty
-    angvel_penalty_scale = -0.5        # Penalty on angular velocity (hold still)
+    angvel_penalty_scale = -0.3        # Penalty on angular velocity (hold still)
+    align_angvel_scale = 0.25          # Reward angular velocity along shortest-arc axis (reduced to avoid spinning)
+    off_axis_penalty_scale = -0.5      # Penalty for spinning off the desired axis
+    align_gate_dist = 1.0              # Only align angvel when within this rot distance (rad)
+    align_angvel_cap = 3.0             # Clamp angular velocity contribution magnitude
     fingertip_dist_penalty_scale = 0.0 # Penalty on fingertip distance (disabled)
     
     # Checkpoint reward configuration (3D uses rotation distance, not angle)
