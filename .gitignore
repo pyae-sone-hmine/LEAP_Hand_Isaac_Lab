@@ -21,8 +21,6 @@
 **/runs/*
 # **/logs/*
 **/recordings/*
-**/output/*
-**/outputs/*
 **/videos/*
 **/wandb/*
 **/.neptune/*
