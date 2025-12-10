@@ -1,10 +1,10 @@
 """
-Python module serving as a project/extension template.
+Python module entrypoint.
+
+Note: We intentionally avoid importing tasks/UI here to prevent heavy Isaac Sim
+dependencies from being pulled in before the AppLauncher sets up paths.
+Callers should import `LEAP_Isaaclab.tasks` (and UI modules if needed) after
+AppLauncher initialization.
 """
 
-# Register Gym environments.
-from .tasks import *
-
-# Register UI extensions.
-from .ui_extension_example import *
-from .ui_extension import set_env_reference, create_goal_angle_ui, destroy_goal_angle_ui
+__all__ = []

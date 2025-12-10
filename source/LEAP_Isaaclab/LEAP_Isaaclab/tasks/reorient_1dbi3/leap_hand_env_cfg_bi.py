@@ -90,6 +90,8 @@ class LeapHandEnvCfgBi(DirectRLEnvCfg):
     decimation = 4
     min_episode_length_s = 20.0
     episode_length_s = 120.0
+    # Disable automatic resets when running a single env (inference).
+    disable_resets_single_env = True
     action_space = 16
     hist_len = 3
     store_cur_actions = True

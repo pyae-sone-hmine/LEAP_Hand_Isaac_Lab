@@ -145,9 +145,11 @@ class ReorientationEnv3D(DirectRLEnv):
         self.y_unit_tensor = torch.tensor([0, 1, 0], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
         self.z_unit_tensor = torch.tensor([0, 0, 1], dtype=torch.float, device=self.device).repeat((self.num_envs, 1))
 
+        min_steps, max_steps = self._episode_length_bounds()
+        self._max_episode_length_steps = max_steps
         self.randomized_episode_lengths = torch.randint(
-            int(self.cfg.min_episode_length_s / (self.cfg.sim.dt * self.cfg.decimation)),
-            self.max_episode_length + 1,
+            min_steps,
+            max_steps + 1,
             (self.num_envs,),
             dtype=torch.int32,
             device=self.device,
@@ -317,7 +319,7 @@ class ReorientationEnv3D(DirectRLEnv):
             self.successes,
             self.consecutive_successes,
             self.has_succeeded,
-            self.max_episode_length,
+            self._max_episode_length_steps,
             self.fingertip_pos,
             self.object_pos,
             self.object_rot,
@@ -427,6 +429,7 @@ class ReorientationEnv3D(DirectRLEnv):
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
             env_ids = self.hand._ALL_INDICES
+        assert env_ids is not None
 
         if self.cfg.enable_adr:
             adr_criteria = (
@@ -437,9 +440,11 @@ class ReorientationEnv3D(DirectRLEnv):
         # resets articulation and rigid body attributes
         super()._reset_idx(env_ids)
 
+        min_steps, max_steps = self._episode_length_bounds()
+        self._max_episode_length_steps = max_steps
         self.randomized_episode_lengths[env_ids] = torch.randint(
-            int(self.cfg.min_episode_length_s / (self.cfg.sim.dt * self.cfg.decimation)),
-            self.max_episode_length + 1,
+            min_steps,
+            max_steps + 1,
             (len(env_ids),),
             dtype=torch.int32,
             device=self.device,
@@ -622,6 +627,21 @@ class ReorientationEnv3D(DirectRLEnv):
 
             # Reset success flags
             self.has_succeeded[env_indices] = False
+
+    def _episode_length_bounds(self) -> tuple[int, int]:
+        """Return (min_steps, max_steps) for episode lengths, with inference overrides."""
+        dt = self.cfg.sim.dt * self.cfg.decimation
+        min_steps = int(self.cfg.min_episode_length_s / dt)
+        max_steps = getattr(self, "_max_episode_length_steps", self.max_episode_length)
+
+        if self.cfg.dynamic_goal_mode:
+            if getattr(self.cfg, "inference_min_episode_length_s", -1.0) > 0:
+                min_steps = int(self.cfg.inference_min_episode_length_s / dt)
+            if getattr(self.cfg, "inference_episode_length_s", -1.0) > 0:
+                max_steps = int(self.cfg.inference_episode_length_s / dt)
+
+        max_steps = max(max_steps, min_steps)
+        return min_steps, max_steps
 
     def _compute_intermediate_values(self):
         # data for hand

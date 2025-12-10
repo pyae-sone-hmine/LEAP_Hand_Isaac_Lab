@@ -5,7 +5,7 @@
 
 from isaaclab.utils import configclass
 
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticRecurrentCfg, RslRlPpoAlgorithmCfg
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
 
 
 @configclass
@@ -17,17 +17,11 @@ class LeapHandPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "reorient_1dbi2"
     device = "cuda:0"
     empirical_normalization = True
-    policy = RslRlPpoActorCriticRecurrentCfg(
+    policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
-        rnn_type="gru",
-        rnn_units=256,
-        rnn_layers=1,
-        use_layernorm=True,
-        rnn_after_mlp=False, 
-        concat_rnn_input=True,
     )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=4.0,

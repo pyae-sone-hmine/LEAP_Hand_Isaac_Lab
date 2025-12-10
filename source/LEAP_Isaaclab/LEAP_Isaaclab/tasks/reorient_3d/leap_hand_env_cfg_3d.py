@@ -92,6 +92,9 @@ class LeapHandEnvCfg3D(DirectRLEnvCfg):
     decimation = 4
     min_episode_length_s = 20.0
     episode_length_s = 120.0
+    # Inference-specific episode timing (<=0 means use training values)
+    inference_min_episode_length_s = 0.1
+    inference_episode_length_s = 0.1
     action_space = 16
     hist_len = 3
     store_cur_actions = True

@@ -419,6 +419,12 @@ class ReorientationEnvBi(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._compute_intermediate_values()
+
+        # Inference (single-env) should not auto-reset; return all False.
+        if self.cfg.disable_resets_single_env and self.num_envs == 1:
+            zeros = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            return zeros, zeros
+
         # reset when cube has fallen
         goal_dist = torch.norm(self.object_pos - self.in_hand_pos, p=2, dim=-1)
         out_of_reach = goal_dist >= self.cfg.fall_dist
